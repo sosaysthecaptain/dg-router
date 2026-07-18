@@ -86,9 +86,8 @@ class PreviewPanel(wx.Panel):
         self.Bind(wx.EVT_MOUSEWHEEL, self.on_wheel)
         self.Bind(wx.EVT_LEFT_DOWN, self.on_down)
         self.Bind(wx.EVT_LEFT_UP, self.on_up)
-        self.Bind(wx.EVT_MIDDLE_DOWN, self.on_down)   # middle-drag pans too
-        self.Bind(wx.EVT_MIDDLE_UP, self.on_up)
         self.Bind(wx.EVT_MOTION, self.on_motion)
+        self.Bind(wx.EVT_MOUSE_CAPTURE_LOST, lambda e: None)
         self.Bind(wx.EVT_SIZE, lambda e: (self.Refresh(), e.Skip()))
         # re-raster from the SVG at the zoom level (crisp like Mac Preview),
         # debounced so it happens after the gesture settles.
@@ -140,6 +139,26 @@ class PreviewPanel(wx.Panel):
         self.Refresh()
         self.Update()
 
+    def zoom_to_bbox(self, x0, y0, x1, y1, margin=0.35):
+        """Frame a world-mm bbox in the viewport (used to show a proposed route)."""
+        if self.bg_bmp is None or self.origin is None:
+            return
+        cw, ch = self.GetClientSize()
+        bw = max(0.5, (x1 - x0) * (1 + margin))
+        bh = max(0.5, (y1 - y0) * (1 + margin))
+        fit = self._fit_ppm()
+        want = min((cw - 16) / bw, (ch - 16) / bh)
+        self.zoom = max(1.0, min(80.0, want / fit))
+        ppm = self._ppm()
+        cxw, cyw = (x0 + x1) / 2.0, (y0 + y1) / 2.0
+        orx, ory = self.origin
+        self.panx = cw / 2.0 - (cw - self.vbw * ppm) / 2.0 - (cxw - orx) * ppm
+        self.pany = ch / 2.0 - (ch - self.vbh * ppm) / 2.0 - (cyw - ory) * ppm
+        if self.zoom <= 1.0:
+            self.panx = self.pany = 0.0
+        self.Refresh()
+        self._rtimer.StartOnce(140)   # re-raster crisp once it settles
+
     def _ratsnest_for(self, name, geom):
         if self.status_loaded:
             return self.unconn.get(name, [])
@@ -179,12 +198,20 @@ class PreviewPanel(wx.Panel):
         self._rtimer.StartOnce(140)
 
     def on_wheel(self, evt):
-        # KiCad: scroll up/down = zoom (around the cursor); drag = pan
+        # two-finger / wheel scroll = PAN; pinch or Cmd/Ctrl+scroll = zoom
         if self.bg_bmp is None:
             return
         d = evt.GetWheelRotation()
-        if d:
+        if evt.ControlDown() or evt.CmdDown():
             self._zoom_at(1.2 if d > 0 else 1 / 1.2, evt.GetX(), evt.GetY())
+            return
+        if self.zoom <= 1.0:            # nothing to pan when fully zoomed out
+            return
+        if evt.GetWheelAxis() == wx.MOUSE_WHEEL_HORIZONTAL:
+            self.panx -= d
+        else:
+            self.pany += d
+        self.Refresh()
 
     def on_pinch(self, evt):
         if self.bg_bmp is None:
@@ -222,10 +249,14 @@ class PreviewPanel(wx.Panel):
     def on_down(self, evt):
         self._drag = (evt.GetX(), evt.GetY(), self.panx, self.pany)
         self._down = (evt.GetX(), evt.GetY())
-        self.CaptureMouse()
+        if not self.HasCapture():          # guard: double-capture crashes wxMac
+            try:
+                self.CaptureMouse()
+            except Exception:
+                pass
 
     def on_up(self, evt):
-        if self.HasCapture():
+        while self.HasCapture():
             self.ReleaseMouse()
         self._drag = None
         # a click (no meaningful drag) selects the net under the cursor
@@ -250,8 +281,7 @@ class PreviewPanel(wx.Panel):
             self.on_pad_pick(name)
 
     def on_motion(self, evt):
-        if self._drag and evt.Dragging() and (evt.LeftIsDown() or
-                                              evt.MiddleIsDown()):
+        if self._drag and evt.Dragging() and evt.LeftIsDown():
             x0, y0, px, py = self._drag
             self.panx = px + (evt.GetX() - x0)
             self.pany = py + (evt.GetY() - y0)
@@ -746,6 +776,17 @@ class RouterDialog(wx.Dialog):
         if dbg is not None:
             extent, bmp = self._build_debug_bitmap(dbg)
             self.preview.set_explored(extent, bmp)
+        # frame what we proposed so it's immediately legible
+        xs, ys = [], []
+        for r in results:
+            for (x1, y1, x2, y2, _w, _l) in r.get("segments", []):
+                xs += [x1, x2]
+                ys += [y1, y2]
+            for (x, y, _d, _dr) in r.get("vias", []):
+                xs.append(x)
+                ys.append(y)
+        if xs:
+            self.preview.zoom_to_bbox(min(xs), min(ys), max(xs), max(ys))
         seg = sum(len(r.get("segments", [])) for r in results)
         via = sum(len(r.get("vias", [])) for r in results)
         if seg == 0 and via == 0:
