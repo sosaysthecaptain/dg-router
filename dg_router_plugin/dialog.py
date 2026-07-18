@@ -10,10 +10,7 @@ unrouted (no emoji, no icons).
 """
 
 import os
-import json
-import tempfile
 import traceback
-import webbrowser
 
 import pcbnew
 import wx
@@ -97,23 +94,14 @@ class RouterDialog(wx.Dialog):
         v.Add(self.btn_route, 0, wx.EXPAND | wx.ALL, 8)
 
         self.act_row = wx.BoxSizer(wx.HORIZONTAL)
+        self.btn_commit = wx.Button(panel, label="Accept")
+        self.btn_revert = wx.Button(panel, label="Reject")
         self.btn_try = wx.Button(panel, label="Try again")
-        self.btn_commit = wx.Button(panel, label="Commit")
-        self.btn_revert = wx.Button(panel, label="Revert")
-        for b in (self.btn_try, self.btn_commit, self.btn_revert):
+        for b in (self.btn_commit, self.btn_revert, self.btn_try):
             self.act_row.Add(b, 1, wx.RIGHT, 6)
         v.Add(self.act_row, 0, wx.EXPAND | wx.LEFT | wx.RIGHT, 8)
 
-        util = wx.BoxSizer(wx.HORIZONTAL)
-        self.btn_open = wx.Button(panel, label="Open full SVG")
-        self.btn_emit = wx.Button(panel, label="Emit job.json")
-        util.Add(self.btn_open, 0, wx.RIGHT, 6)
-        util.Add(self.btn_emit, 0, wx.RIGHT, 6)
-        util.AddStretchSpacer(1)
-        util.Add(wx.Button(panel, wx.ID_CANCEL, label="Close"), 0)
-        v.Add(util, 0, wx.EXPAND | wx.ALL, 8)
-
-        self.status = wx.StaticText(panel, label="Routes preview in KiCad's canvas.")
+        self.status = wx.StaticText(panel, label="Loading…")
         v.Add(self.status, 0, wx.ALL, 8)
 
         panel.SetSizer(v)
@@ -122,16 +110,16 @@ class RouterDialog(wx.Dialog):
         self.btn_try.Bind(wx.EVT_BUTTON, self.on_try_again)
         self.btn_commit.Bind(wx.EVT_BUTTON, self.on_commit)
         self.btn_revert.Bind(wx.EVT_BUTTON, self.on_revert)
-        self.btn_open.Bind(wx.EVT_BUTTON, self.on_open)
-        self.btn_emit.Bind(wx.EVT_BUTTON, self.on_emit)
         self.net_list.Bind(wx.EVT_LIST_ITEM_SELECTED, self.on_select)
-        self.Bind(wx.EVT_BUTTON, self.on_close_btn, id=wx.ID_CANCEL)
         self.Bind(wx.EVT_CLOSE, self.on_close)
 
         self._show_actions(False)
+        # instant window: show a loading state, disable Route until status loads
+        self.btn_route.Disable()
         if self.board.GetFileName():
-            self.status.SetLabel("Computing routing status (DRC)…")
             wx.CallAfter(self._load_status)
+        else:
+            self.status.SetLabel("Save the board to begin.")
 
     # --- helpers ------------------------------------------------------------
 
@@ -155,11 +143,23 @@ class RouterDialog(wx.Dialog):
         self.status_map = status
         self.unconn = unconn
         self._apply_status_colors()
+        self.btn_route.Enable()
         c = {"routed": 0, "partial": 0, "unrouted": 0}
         for x in status.values():
             c[x] += 1
         self.status.SetLabel("%d routed  %d partial  %d unrouted"
                              % (c["routed"], c["partial"], c["unrouted"]))
+
+    def _reset_pass(self):
+        """After Accept/Reject: clear selection + highlight, re-cock for the
+        next pass."""
+        for i in range(self.net_list.GetItemCount()):
+            if self.net_list.IsItemChecked(i):
+                self.net_list.CheckItem(i, False)
+        self._clear_highlight()
+        self._proposed_nets = []
+        self._refresh_canvas()
+        self._show_actions(False)
 
     def _checked_names(self):
         return [self.nets[i]["name"] for i in range(self.net_list.GetItemCount())
@@ -173,13 +173,6 @@ class RouterDialog(wx.Dialog):
         return router.RouteParams(
             self.board, via_cost=float(self.via_cost.GetValue()),
             layer_names=self.selected_layers(), seed=self._try_seed, jitter=jitter)
-
-    def out_dir(self):
-        bp = self.board.GetFileName()
-        base = os.path.dirname(bp) if bp else tempfile.gettempdir()
-        d = os.path.join(base, "dg-router-out")
-        os.makedirs(d, exist_ok=True)
-        return d
 
     def _remove_added(self):
         for it in self._added:
@@ -302,8 +295,8 @@ class RouterDialog(wx.Dialog):
 
         ok = sum(1 for r in results if r.get("ok"))
         self.status.SetLabel(
-            "Proposed %d/%d nets (+%d items) — shown in KiCad. "
-            "Commit / Try again / Revert" % (ok, len(results), len(self._added)))
+            "Proposed %d/%d nets (+%d items). Accept / Reject / Try again"
+            % (ok, len(results), len(self._added)))
         self._show_actions(True)
 
     def on_route(self, _evt):
@@ -312,52 +305,24 @@ class RouterDialog(wx.Dialog):
 
     def on_try_again(self, _evt):
         self._try_seed += 1
-        self._compute(jitter=0.35)
+        self._compute(jitter=0.35)   # keeps selection; different solution
 
-    def on_revert(self, _evt):
+    def on_revert(self, _evt):       # Reject
         self._remove_added()
-        self._refresh_canvas()
-        self.status.SetLabel("Reverted — nothing kept.")
-        self._show_actions(False)
+        self.status.SetLabel("Rejected — nothing kept. Pick nets and Route again.")
+        self._reset_pass()
 
-    def on_commit(self, _evt):
+    def on_commit(self, _evt):       # Accept
         for name in self._proposed_nets:
             self.status_map[name] = "routed"
         self._apply_status_colors()
         n = len(self._added)
-        self._added = []           # keep them in the board; stop tracking
-        self._proposed_nets = []
-        self.status.SetLabel("Committed %d items. Save (Cmd+S) in KiCad to keep."
-                             % n)
-        self._show_actions(False)
+        self._added = []             # keep them in the board; stop tracking
+        self.status.SetLabel("Accepted %d items (Cmd+S to save). "
+                             "Pick nets and Route again." % n)
+        self._reset_pass()
 
     # --- misc ---------------------------------------------------------------
-
-    def on_open(self, _evt):
-        bp = self.board.GetFileName()
-        if not bp or not os.path.exists(bp):
-            wx.MessageBox("Save the board first.", "dg-router")
-            return
-        out = os.path.join(self.out_dir(), "preview.svg")
-        try:
-            shim.render_board_svg(bp, out)
-        except Exception as e:  # noqa: BLE001
-            wx.MessageBox("Render failed:\n%s" % e, "dg-router")
-            return
-        webbrowser.open("file://" + out)
-
-    def on_emit(self, _evt):
-        prefer = {"layer": self.selected_layers()[0],
-                  "viaCost": self.via_cost.GetValue(),
-                  "edgeHug": round(self.edge_hug.GetValue() / 100.0, 2)}
-        job = shim.build_job(self._checked_names(), prefer,
-                             follow_existing=self.follow.GetValue())
-        out = os.path.join(self.out_dir(), "job.json")
-        shim.write_job(job, out)
-        wx.MessageBox(json.dumps(job, indent=2), "job.json  →  " + out)
-
-    def on_close_btn(self, _evt):
-        self.Close()
 
     def on_close(self, _evt):
         # discard any uncommitted preview + highlight so we leave a clean board
