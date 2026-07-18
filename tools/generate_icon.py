@@ -55,11 +55,24 @@ def build():
                     if 0 <= xx < W and 0 <= yy < H:
                         px[yy * W + xx] = GREEN
 
-    # trace: enters left, right-angle up, ends at a via
-    hline(34, 6, 30, 2)
-    vline(30, 12, 34, 2)
-    dot(30, 12, 4)
-    dot(6, 34, 4)
+    def line(x0, y0, x1, y1, t):
+        n = max(abs(x1 - x0), abs(y1 - y0)) or 1
+        for s in range(n + 1):
+            u = s / n
+            cx = round(x0 + (x1 - x0) * u)
+            cy = round(y0 + (y1 - y0) * u)
+            for yy in range(cy - t, cy + t + 1):
+                for xx in range(cx - t, cx + t + 1):
+                    if 0 <= xx < W and 0 <= yy < H:
+                        px[yy * W + xx] = GREEN
+
+    # octilinear trace with a 45deg bend: horizontal -> 45 -> vertical, via at
+    # each end. Shifted right so the trace is centered in the field.
+    line(13, 35, 24, 35, 2)     # horizontal in
+    line(24, 35, 33, 26, 2)     # 45-degree bend
+    line(33, 26, 33, 14, 2)     # vertical up
+    dot(13, 35, 4)
+    dot(33, 14, 4)
     return px
 
 
