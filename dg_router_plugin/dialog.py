@@ -393,6 +393,10 @@ class RouterDialog(wx.Dialog):
             self.act_row.Add(b, 1, wx.RIGHT, 6)
         left.Add(self.act_row, 0, wx.EXPAND | wx.LEFT | wx.RIGHT, 8)
 
+        self.gauge = wx.Gauge(panel, range=100)
+        left.Add(self.gauge, 0, wx.EXPAND | wx.LEFT | wx.RIGHT, 8)
+        self.gauge.Hide()
+
         self.status = wx.StaticText(panel, label="Loading…")
         left.Add(self.status, 0, wx.ALL, 8)
 
@@ -531,17 +535,35 @@ class RouterDialog(wx.Dialog):
             wx.MessageBox("Save the board first.", "dg-router")
             return
         self.status.SetLabel("Routing…")
-        wx.BeginBusyCursor()
+        self.gauge.SetRange(len(names))
+        self.gauge.SetValue(0)
+        self.gauge.Show()
+        self.panel.Layout()
+        shown = []
+
+        def on_net(done, total, result):
+            # reveal each net's route as it's computed + advance the bar. Update()
+            # repaints synchronously (no event-loop reentry -> safe).
+            shown.append(result)
+            self.preview.set_proposed(list(shown))
+            self.gauge.SetValue(done)
+            self.status.SetLabel("Routing %d/%d — %s" % (done, total, result["net"]))
+            self.preview.Update()
+            self.gauge.Update()
+            self.status.Update()
+
         try:
             unconn = self.unconn or shim.drc_unconnected(bp)
             results = router.route_batch(self.board, names, unconn,
-                                         self._params(jitter=jitter))
+                                         self._params(jitter=jitter), on_net=on_net)
         except Exception as e:  # noqa: BLE001
-            wx.EndBusyCursor()
+            self.gauge.Hide()
+            self.panel.Layout()
             wx.MessageBox("Routing error:\n%s\n\n%s" % (e, traceback.format_exc()),
                           "dg-router")
             return
-        wx.EndBusyCursor()
+        self.gauge.Hide()
+        self.panel.Layout()
 
         self.proposed = results
         self.preview.set_proposed(results)   # shown in preview only

@@ -610,31 +610,35 @@ def refill_zones(board):
         pass
 
 
-def route_batch(board, net_names, unconn, params, on_progress=None):
+def route_batch(board, net_names, unconn, params, on_progress=None, on_net=None):
     """Route a batch. Nets already routed this batch are (a) obstacles for the
     rest (no crossing/shorting) and (b) attractors (bus bundling). Longest net
-    first anchors the bus. Does NOT mutate the board."""
+    first anchors the bus. Does NOT mutate the board. on_net(done, total, result)
+    fires after each net (for progress + progressive reveal)."""
     def gap_len(name):
         return sum(math.hypot(g[2] - g[0], g[3] - g[1])
                    for g in unconn.get(name, []))
     ordered = sorted(net_names, key=gap_len, reverse=True)
+    total = len(ordered)
 
     results = []
     prior_segments, prior_vias, attract = [], [], {}
     for name in ordered:
         gaps = unconn.get(name, [])
         if not gaps:
-            results.append({"net": name, "ok": True, "reason": "already routed",
-                            "gaps": 0, "routed": 0, "segments": [], "vias": []})
-            continue
-        r = route_net(board, name, gaps, params, prior_segments=prior_segments,
-                      prior_vias=prior_vias, attract_paths=attract,
-                      on_progress=on_progress)
+            r = {"net": name, "ok": True, "reason": "already routed",
+                 "gaps": 0, "routed": 0, "segments": [], "vias": []}
+        else:
+            r = route_net(board, name, gaps, params,
+                          prior_segments=prior_segments, prior_vias=prior_vias,
+                          attract_paths=attract, on_progress=on_progress)
+            prior_segments += r.get("segments", [])
+            prior_vias += r.get("vias", [])
+            for li, cells in r.get("path_cells", {}).items():
+                attract.setdefault(li, []).extend(cells)
         results.append(r)
-        prior_segments += r.get("segments", [])
-        prior_vias += r.get("vias", [])
-        for li, cells in r.get("path_cells", {}).items():
-            attract.setdefault(li, []).extend(cells)
+        if on_net:
+            on_net(len(results), total, r)
     return results
 
 
