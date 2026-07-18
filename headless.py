@@ -44,6 +44,8 @@ def main(argv=None):
     ap.add_argument("--connect", nargs="*", default=[],
                     help="route only these connections, e.g. U5.1:C12.2 "
                          "(a 'job' of specific pad-pairs); implies --solve")
+    ap.add_argument("--auto-trunk", dest="auto_trunk", default=None,
+                    help="route a power net as trunk (MST spine) + branches")
     ap.add_argument("--layer", default="B.Cu", help="prefer layer")
     ap.add_argument("--via-cost", type=int, default=80)
     ap.add_argument("--edge-hug", type=float, default=0.0)
@@ -66,7 +68,7 @@ def main(argv=None):
                                        "dg-router-out")
 
     if args.list or not (args.status or args.render or args.render_png
-                         or args.emit or args.solve
+                         or args.emit or args.solve or args.auto_trunk
                          or args.list_connections is not None or args.connect):
         nets = shim.list_nets(board)
         print("copper layers:", ", ".join(shim.copper_layer_names(board)))
@@ -112,6 +114,33 @@ def main(argv=None):
                 pass
         after = sum(len(v) for v in shim.drc_unconnected(out).values())
         print("tracks added: %d" % summary["tracks_added"])
+        print("unconnected: %d -> %d  (wrote %s)" % (before, after, out))
+
+    if args.auto_trunk:
+        before = sum(len(v) for v in shim.drc_unconnected(args.board).values())
+        params = router.RouteParams(
+            board, pitch_mm=args.pitch, via_cost=args.route_via_cost,
+            layer_names=[s.strip() for s in args.layers.split(",") if s.strip()],
+            objective=args.objective, prefer_layer=args.prefer)
+        r = router.auto_trunk(board, args.auto_trunk, params)
+        print("  %-22s ok=%s  trunk+branches=%d routed=%d"
+              % (r["net"], r.get("ok"), r.get("gaps", 0), r.get("routed", 0)))
+        added = 0
+        if r.get("segments") or r.get("vias"):
+            added = len(router.write_result(board, r["net_code"], r))
+        router.refill_zones(board)
+        out = os.path.join(out_dir, "routed.kicad_pcb")
+        os.makedirs(out_dir, exist_ok=True)
+        pcbnew.SaveBoard(out, board)
+        import shutil
+        src_pro = os.path.splitext(os.path.abspath(args.board))[0] + ".kicad_pro"
+        if os.path.exists(src_pro):
+            try:
+                shutil.copyfile(src_pro, os.path.join(out_dir, "routed.kicad_pro"))
+            except OSError:
+                pass
+        after = sum(len(v) for v in shim.drc_unconnected(out).values())
+        print("tracks added: %d" % added)
         print("unconnected: %d -> %d  (wrote %s)" % (before, after, out))
 
     if args.status:

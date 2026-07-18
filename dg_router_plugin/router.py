@@ -335,14 +335,21 @@ def nearest_free(cm, li, cell, max_rings=16):
 
 
 def astar(cm, starts, goal_cell, goal_layers, params, max_expansions=1_500_000,
-          on_progress=None, progress_every=600):
-    """starts: list of (i,j,li). goal reached at goal_cell on any goal layer.
+          on_progress=None, progress_every=600, goal_cells=None):
+    """starts: list of (i,j,li). Goal reached at goal_cell on any goal layer,
+    OR — if goal_cells (a set of (i,j,li)) is given — at any of those cells
+    (route-to-copper: a branch joins an existing trunk wherever it's nearest).
     Returns list of (i,j,li) or None. on_progress(cm, new_cells) is called
     periodically with cells popped since the last call (for live animation)."""
     gx, gy = goal_cell
     goalset = set(goal_layers)
     attract_bonus = 0.6
     new_cells = []
+
+    def is_goal(ci, cj, cl):
+        if goal_cells is not None:
+            return (ci, cj, cl) in goal_cells
+        return (ci, cj) == goal_cell and cl in goalset
 
     def h(i, j):
         dx, dy = abs(i - gx), abs(j - gy)
@@ -363,7 +370,7 @@ def astar(cm, starts, goal_cell, goal_layers, params, max_expansions=1_500_000,
     while open_heap:
         _, gc, st = heapq.heappop(open_heap)
         ci, cj, cl, cd = st
-        if (ci, cj) == goal_cell and cl in goalset:
+        if is_goal(ci, cj, cl):
             if on_progress and new_cells:
                 on_progress(cm, new_cells)
             return _reconstruct(came, st)
@@ -1049,6 +1056,139 @@ def route_net(board, net_name, gaps, params, prior_segments=None,
             "gaps": len(gaps), "routed": routed, "segments": segments,
             "vias": vias, "net_code": net_code, "width": width,
             "path_cells": path_cells_by_layer, "costmap": cm}
+
+
+def _tree_diameter_path(pads, edges):
+    """Node indices along the longest (geometric) path of the pad MST — the
+    natural spine for a power trunk. Two-sweep tree-diameter."""
+    from collections import defaultdict
+    adj = defaultdict(list)
+    for (i, j) in edges:
+        w = math.hypot(pads[i][0] - pads[j][0], pads[i][1] - pads[j][1])
+        adj[i].append((j, w))
+        adj[j].append((i, w))
+
+    def farthest(src):
+        parent = {src: None}
+        dist = {src: 0.0}
+        stack = [src]
+        best = src
+        while stack:
+            u = stack.pop()
+            for (v, w) in adj[u]:
+                if v not in parent:
+                    parent[v] = u
+                    dist[v] = dist[u] + w
+                    stack.append(v)
+                    if dist[v] > dist[best]:
+                        best = v
+        return best, parent
+
+    u, _ = farthest(0)
+    v, parent = farthest(u)
+    path, cur = [], v
+    while cur is not None:
+        path.append(cur)
+        cur = parent[cur]
+    return path
+
+
+def auto_trunk(board, net_name, params, on_progress=None):
+    """Power-style routing: route the net's MST-diameter as a trunk, then drop
+    each remaining pin as a branch to the nearest trunk copper (route-to-copper).
+    Returns one aggregated result, same shape as route_net."""
+    net = _find_net(board, net_name)
+    if net is None:
+        return {"net": net_name, "ok": False, "reason": "net not found"}
+    net_code = net.GetNetCode()
+    routable = params.layer_ids
+
+    seen, pads = set(), []
+    for pad in board.GetPads():
+        if pad.GetNetCode() != net_code:
+            continue
+        p = pad.GetPosition()
+        key = (round(p.x / _NM, 3), round(p.y / _NM, 3))
+        if key not in seen:
+            seen.add(key)
+            pads.append((p.x / _NM, p.y / _NM))
+    if len(pads) < 2:
+        return {"net": net_name, "ok": False, "reason": "need >=2 pads",
+                "gaps": 0, "routed": 0, "segments": [], "vias": []}
+
+    spine = _tree_diameter_path(pads, shim.mst_edges(pads))
+    spine_set = set(spine)
+    trunk_gaps = [(pads[spine[k]][0], pads[spine[k]][1],
+                   pads[spine[k + 1]][0], pads[spine[k + 1]][1])
+                  for k in range(len(spine) - 1)]
+
+    res = route_net(board, net_name, trunk_gaps, params, on_progress=on_progress)
+    segments = list(res.get("segments", []))
+    vias = list(res.get("vias", []))
+    routed = res.get("routed", 0)
+    total = len(trunk_gaps)
+    cm = res.get("costmap")
+
+    goal_cells = set()
+    for li, cells in res.get("path_cells", {}).items():
+        for (i, j) in cells:
+            goal_cells.add((i, j, li))
+    if cm is None or not goal_cells:      # trunk failed — nothing to branch onto
+        res["segments"], res["vias"] = segments, vias
+        return res
+
+    width, clearance, via_dia, via_drill = params.net_class(net_name)
+    fine_inflate = clearance + width / 2.0 + 0.04
+    lidx = {L: k for k, L in enumerate(routable)}
+
+    def centroid():
+        xs = [c[0] for c in goal_cells]
+        ys = [c[1] for c in goal_cells]
+        return (sum(xs) // len(xs), sum(ys) // len(ys))
+
+    for pi in [i for i in range(len(pads)) if i not in spine_set]:
+        px, py = pads[pi]
+        total += 1
+        pad = _pad_at(board, net_code, px, py)
+        pmax = max(pad[2], pad[3]) if pad else width
+        neck = max(params.min_track, min(pad[2], pad[3])) if pad else width
+        for sli in [lidx[L] for L in _pad_layers_at(board, net_code,
+                                                    px, py, routable)]:
+            # branch escape ignores same-net proposed copper (the trunk is the
+            # GOAL, not an obstacle); other-net copper is already in the grid.
+            es = escape_pad(board, net_code, routable[sli], sli, px, py, pmax,
+                            cm, 0.05, fine_inflate)
+            if not es:
+                continue
+            es_pts, es_ec = es
+            cells3 = astar(cm, [(es_ec[0], es_ec[1], sli)], centroid(),
+                           list(range(len(routable))), params,
+                           goal_cells=goal_cells, on_progress=on_progress)
+            if not cells3:
+                continue
+            runs, via_cells = split_layer_runs(cells3)
+            for ri, (li, run) in enumerate(runs):
+                cpoly = octi_pull(cm, li, run)
+                if ri == 0:
+                    cpoly = es_pts[:-1] + cpoly
+                ns = neck if ri == 0 else width
+                segments += build_segments(cpoly, routable[li], width, ns, width)
+                for (i, j) in run:
+                    goal_cells.add((i, j, li))
+            for (vi, vj) in via_cells:
+                wx_, wy_ = cm.to_world(vi, vj)
+                vias.append((wx_, wy_, via_dia, via_drill))
+                for li in range(len(cm.layers)):
+                    cm._disc(cm.blocked[li], wx_, wy_,
+                             via_dia / 2.0 + cm.track_inflate)
+                cm._disc(cm.via_blocked, wx_, wy_, via_dia / 2.0 + cm.via_inflate)
+            routed += 1
+            break
+
+    return {"net": net_name, "ok": routed == total and total > 0,
+            "gaps": total, "routed": routed, "segments": segments,
+            "vias": vias, "net_code": net_code, "width": width,
+            "path_cells": {}, "costmap": cm}
 
 
 def write_result(board, net_code, result):
