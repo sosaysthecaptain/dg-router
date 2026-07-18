@@ -137,11 +137,14 @@ class PreviewPanel(wx.Panel):
         bx0, by0 = self._origin_screen(ppm)
         wxmm = self.origin[0] + (mx - bx0) / ppm
         wymm = self.origin[1] + (my - by0) / ppm
-        self.zoom = min(80.0, max(0.3, self.zoom * factor))
+        # zoom 1.0 == whole board fits the viewport; don't zoom out past that
+        self.zoom = min(80.0, max(1.0, self.zoom * factor))
         ppm2 = self._ppm()
         cw, ch = self.GetClientSize()
         self.panx = mx - (wxmm - self.origin[0]) * ppm2 - (cw - self.vbw * ppm2) / 2.0
         self.pany = my - (wymm - self.origin[1]) * ppm2 - (ch - self.vbh * ppm2) / 2.0
+        if self.zoom <= 1.0:            # fully zoomed out -> recenter the board
+            self.panx = self.pany = 0.0
         self.Refresh()
         self._rtimer.StartOnce(140)
 
@@ -152,7 +155,10 @@ class PreviewPanel(wx.Panel):
         if evt.ControlDown() or evt.CmdDown():   # modifier + scroll = zoom
             self._zoom_at(1.2 if d > 0 else 1 / 1.2, evt.GetX(), evt.GetY())
             return
-        # two-finger / wheel scroll = PAN (KiCad convention)
+        # two-finger / wheel scroll = PAN (KiCad convention). No panning when
+        # fully zoomed out — the whole board is already in view.
+        if self.zoom <= 1.0:
+            return
         if evt.GetWheelAxis() == wx.MOUSE_WHEEL_HORIZONTAL:
             self.panx -= d
         else:
@@ -166,7 +172,7 @@ class PreviewPanel(wx.Panel):
             if evt.IsGestureStart():
                 self._pinch_base = self.zoom
             pos = evt.GetPosition()
-            target = max(0.3, min(80.0, self._pinch_base * evt.GetZoomFactor()))
+            target = max(1.0, min(80.0, self._pinch_base * evt.GetZoomFactor()))
             self._zoom_at(target / self.zoom if self.zoom else 1.0, pos.x, pos.y)
         except Exception:
             pass
