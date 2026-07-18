@@ -35,7 +35,8 @@ _BG = wx.Colour(24, 24, 24)
 
 _BG_PPM = 16.0  # background raster resolution (px per mm)
 
-_STATUS_EMOJI = {None: "", "routed": "✅", "partial": "🟡", "unrouted": "⚪"}
+# uniform circle glyphs (mixing a checkbox emoji with circles looked awful)
+_STATUS_EMOJI = {None: "", "routed": "🟢", "partial": "🟡", "unrouted": "⚪"}
 
 
 class PreviewPanel(wx.Panel):
@@ -54,6 +55,7 @@ class PreviewPanel(wx.Panel):
         self.unconn = {}
         self.status_loaded = False
         self.proposed = []          # list of route result dicts
+        self._heat = None           # live A* exploration overlay (bitmap)
         self.zoom = 1.0
         self.panx = self.pany = 0.0
         self._drag = None
@@ -90,6 +92,37 @@ class PreviewPanel(wx.Panel):
         for name in names:
             self.unconn[name] = []
             self._geom_cache.pop(name, None)
+        self.Refresh()
+
+    # --- live A* exploration overlay (Update()-driven, no SafeYield) --------
+
+    def begin_search(self):
+        if self.bg_bmp is None:
+            return
+        self._heat = wx.Bitmap.FromRGBA(self.bg_bmp.GetWidth(),
+                                        self.bg_bmp.GetHeight(), 0, 0, 0, 0)
+        self.Refresh()
+        self.Update()
+
+    def add_search(self, cm, cells):
+        if self._heat is None or self.origin is None:
+            return
+        orx, ory = self.origin
+        dc = wx.MemoryDC(self._heat)
+        gc = wx.GraphicsContext.Create(dc)
+        gc.SetPen(wx.Pen(wx.Colour(0, 0, 0, 0), 0))
+        gc.SetBrush(wx.Brush(wx.Colour(90, 160, 255, 55)))
+        r = max(2, cm.pitch * _BG_PPM / 2.0)
+        for (i, j, _li) in cells:
+            wxmm, wymm = cm.to_world(i, j)
+            gc.DrawRectangle((wxmm - orx) * _BG_PPM - r,
+                             (wymm - ory) * _BG_PPM - r, 2 * r, 2 * r)
+        dc.SelectObject(wx.NullBitmap)   # release BEFORE repaint
+        self.Refresh()
+        self.Update()                    # force a synchronous repaint, no yield
+
+    def end_search(self):
+        self._heat = None
         self.Refresh()
 
     def _ratsnest_for(self, name, geom):
@@ -199,18 +232,23 @@ class PreviewPanel(wx.Panel):
         sy0 = max(0, int((0 - by0) * k))
         sx1 = min(bgW, int((cw - bx0) * k) + 2)
         sy1 = min(bgH, int((ch - by0) * k) + 2)
+        gc = wx.GraphicsContext.Create(dc)
         if sx1 > sx0 and sy1 > sy0:
-            sub = self.bg_bmp.GetSubBitmap(wx.Rect(sx0, sy0, sx1 - sx0, sy1 - sy0))
+            rect = wx.Rect(sx0, sy0, sx1 - sx0, sy1 - sy0)
             dw = max(1, int((sx1 - sx0) / k))
             dh = max(1, int((sy1 - sy0) / k))
-            scaled = sub.ConvertToImage().Scale(
+            dx, dy = int(bx0 + sx0 / k), int(by0 + sy0 / k)
+            sub = self.bg_bmp.GetSubBitmap(rect).ConvertToImage().Scale(
                 dw, dh, wx.IMAGE_QUALITY_NORMAL).ConvertToBitmap()
-            dc.DrawBitmap(scaled, int(bx0 + sx0 / k), int(by0 + sy0 / k))
+            dc.DrawBitmap(sub, dx, dy)
+            if self._heat is not None:   # live search overlay, same region
+                hs = self._heat.GetSubBitmap(rect).ConvertToImage().Scale(
+                    dw, dh).ConvertToBitmap()
+                gc.DrawBitmap(hs, dx, dy, dw, dh)
 
         def S(x, y):  # mm -> screen px
             return (bx0 + (x - orx) * ppm, by0 + (y - ory) * ppm)
 
-        gc = wx.GraphicsContext.Create(dc)
         for name in self.selected:
             g = self._geom_cache.get(name)
             if not g:
@@ -438,18 +476,23 @@ class RouterDialog(wx.Dialog):
             return
         self.status.SetLabel("Routing…")
         self.preview.set_proposed([])
-        wx.BeginBusyCursor()
+        self.preview.begin_search()
+
+        def on_progress(cm, cells):
+            self.preview.add_search(cm, cells)   # Update()-driven, no SafeYield
+
         try:
             params = self._params(jitter=jitter)
             unconn = self.preview.unconn if self.preview.status_loaded \
                 else shim.drc_unconnected(bp)
-            results = router.route_batch(self.board, names, unconn, params)
+            results = router.route_batch(self.board, names, unconn, params,
+                                         on_progress=on_progress)
         except Exception as e:  # noqa: BLE001
-            wx.EndBusyCursor()
+            self.preview.end_search()
             wx.MessageBox("Routing error:\n%s\n\n%s" % (e, traceback.format_exc()),
                           "dg-router")
             return
-        wx.EndBusyCursor()
+        self.preview.end_search()
 
         self.proposed = results
         self.preview.set_proposed(results)
