@@ -570,7 +570,9 @@ def route_net(board, net_name, gaps, params, prior_segments=None,
 
 
 def write_result(board, net_code, result):
-    n = 0
+    """Add tracks + vias to the board. Returns the list of added board items
+    (so a caller can Remove() them to revert)."""
+    items = []
     for (x1, y1, x2, y2, w, layer_id) in result["segments"]:
         t = pcbnew.PCB_TRACK(board)
         t.SetStart(pcbnew.VECTOR2I(int(round(x1 * _NM)), int(round(y1 * _NM))))
@@ -579,7 +581,7 @@ def write_result(board, net_code, result):
         t.SetLayer(layer_id)
         t.SetNetCode(net_code)
         board.Add(t)
-        n += 1
+        items.append(t)
     for (x, y, dia, drill) in result.get("vias", []):
         v = pcbnew.PCB_VIA(board)
         v.SetPosition(pcbnew.VECTOR2I(int(round(x * _NM)), int(round(y * _NM))))
@@ -592,8 +594,8 @@ def write_result(board, net_code, result):
         v.SetDrill(int(round(drill * _NM)))
         v.SetNetCode(net_code)
         board.Add(v)
-        n += 1
-    return n
+        items.append(v)
+    return items
 
 
 def refill_zones(board):
@@ -641,7 +643,7 @@ def solve(board_path, net_names, out_path, params=None, prefer_name=None):
     total = 0
     for r in results:
         if r.get("segments") or r.get("vias"):
-            total += write_result(board, r["net_code"], r)
+            total += len(write_result(board, r["net_code"], r))
         for k in ("segments", "vias", "path_cells", "costmap"):
             r.pop(k, None)
 
