@@ -486,6 +486,7 @@ class RouterDialog(wx.Dialog):
         self.job = {}          # conn_id -> {'id','net','gap'} : the current job
         self._loaded = False
         self._try_seed = 0
+        self._cancel = threading.Event()
 
         panel = wx.Panel(self)
         main = wx.BoxSizer(wx.HORIZONTAL)
@@ -523,44 +524,63 @@ class RouterDialog(wx.Dialog):
             lrow.Add(cb, 0, wx.RIGHT, 6)
         left.Add(lrow, 0, wx.LEFT | wx.BOTTOM, 8)
 
+        # tool tabs: Route vs Power net (auto-trunk) — separate tools, shared
+        # net list + preview + accept/reject loop
+        self.tabs = wx.Notebook(panel)
+        route_pg = wx.Panel(self.tabs)
+        power_pg = wx.Panel(self.tabs)
+        self.tabs.AddPage(route_pg, "Route")
+        self.tabs.AddPage(power_pg, "Power net")
+        left.Add(self.tabs, 0, wx.EXPAND | wx.ALL, 8)
+
+        rp = wx.BoxSizer(wx.VERTICAL)
         prow = wx.BoxSizer(wx.HORIZONTAL)
-        prow.Add(wx.StaticText(panel, label="Prefer:"),
+        prow.Add(wx.StaticText(route_pg, label="Prefer:"),
                  0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 6)
-        self.prefer = wx.Choice(panel, choices=["(any)"] + self.layers)
+        self.prefer = wx.Choice(route_pg, choices=["(any)"] + self.layers)
         self.prefer.SetSelection(0)
         prow.Add(self.prefer, 0)
-        left.Add(prow, 0, wx.LEFT | wx.BOTTOM, 8)
+        rp.Add(prow, 0, wx.ALL, 6)
 
         self._obj_keys = ["least_obtrusive", "direct", "follow", "hug"]
         self.objective = wx.RadioBox(
-            panel, label="Objective",
+            route_pg, label="Objective",
             choices=["Least obtrusive", "Direct", "Follow existing", "Hug edges"],
-            majorDimension=1, style=wx.RA_SPECIFY_COLS)   # vertical stack
-        self.objective.SetSelection(0)   # least obtrusive default
-        left.Add(self.objective, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 8)
+            majorDimension=1, style=wx.RA_SPECIFY_COLS)
+        self.objective.SetSelection(0)
+        rp.Add(self.objective, 0, wx.EXPAND | wx.ALL, 6)
 
         grid = wx.FlexGridSizer(cols=2, vgap=6, hgap=8)
         grid.AddGrowableCol(1, 1)
-        grid.Add(wx.StaticText(panel, label="Via cost:"),
+        grid.Add(wx.StaticText(route_pg, label="Via cost:"),
                  0, wx.ALIGN_CENTER_VERTICAL)
-        self.via_cost = wx.Slider(panel, value=10, minValue=0, maxValue=100,
+        self.via_cost = wx.Slider(route_pg, value=10, minValue=0, maxValue=100,
                                   style=wx.SL_HORIZONTAL | wx.SL_LABELS)
         grid.Add(self.via_cost, 0, wx.EXPAND)
-        left.Add(grid, 0, wx.EXPAND | wx.ALL, 8)
+        rp.Add(grid, 0, wx.EXPAND | wx.ALL, 6)
+
+        self.job_label = wx.StaticText(route_pg, label="Job: empty")
+        rp.Add(self.job_label, 0, wx.ALL, 6)
+        self.btn_route = wx.Button(route_pg, label="Route")
+        self.btn_route.SetDefault()
+        rp.Add(self.btn_route, 0, wx.EXPAND | wx.ALL, 6)
+        route_pg.SetSizer(rp)
+
+        pp = wx.BoxSizer(wx.VERTICAL)
+        pp.Add(wx.StaticText(power_pg, label=(
+            "Route a power/multi-pin net as a trunk (spine) + branches.\n"
+            "Select the net (row or a pad), then Auto-trunk.")),
+            0, wx.ALL, 8)
+        self.btn_trunk = wx.Button(power_pg, label="Auto-trunk selected net")
+        pp.Add(self.btn_trunk, 0, wx.EXPAND | wx.ALL, 6)
+        power_pg.SetSizer(pp)
 
         self.chk_debug = wx.CheckBox(panel, label="Debug: show A* search heatmap")
         left.Add(self.chk_debug, 0, wx.LEFT | wx.BOTTOM, 8)
 
-        self.job_label = wx.StaticText(panel, label="Job: empty")
-        left.Add(self.job_label, 0, wx.LEFT | wx.RIGHT, 8)
-
-        rrow = wx.BoxSizer(wx.HORIZONTAL)
-        self.btn_route = wx.Button(panel, label="Route")
-        self.btn_route.SetDefault()
-        self.btn_trunk = wx.Button(panel, label="Auto-trunk")
-        rrow.Add(self.btn_route, 1, wx.RIGHT, 6)
-        rrow.Add(self.btn_trunk, 0)
-        left.Add(rrow, 0, wx.EXPAND | wx.ALL, 8)
+        self.btn_cancel = wx.Button(panel, label="Cancel")
+        left.Add(self.btn_cancel, 0, wx.EXPAND | wx.LEFT | wx.RIGHT, 8)
+        self.btn_cancel.Hide()
 
         self.act_row = wx.BoxSizer(wx.HORIZONTAL)
         self.btn_commit = wx.Button(panel, label="Accept")
@@ -594,6 +614,7 @@ class RouterDialog(wx.Dialog):
 
         self.btn_route.Bind(wx.EVT_BUTTON, self.on_route)
         self.btn_trunk.Bind(wx.EVT_BUTTON, self.on_trunk)
+        self.btn_cancel.Bind(wx.EVT_BUTTON, self.on_cancel)
         self.btn_try.Bind(wx.EVT_BUTTON, self.on_try_again)
         self.btn_commit.Bind(wx.EVT_BUTTON, self.on_commit)
         self.btn_revert.Bind(wx.EVT_BUTTON, self.on_revert)
@@ -617,13 +638,17 @@ class RouterDialog(wx.Dialog):
     # --- helpers ---
     def _show_actions(self, show):
         self.act_row.ShowItems(show)
-        self.btn_route.Show(not show)
-        self.btn_trunk.Show(not show)
+        self.tabs.Enable(not show)            # can't start a new route mid-decision
         if show:
             self.btn_commit.SetDefault()      # Accept is the primary action now
         else:
             self.btn_route.SetDefault()
         self.panel.Layout()
+
+    def on_cancel(self, _evt):
+        self._cancel.set()
+        self.btn_cancel.Disable()
+        self.status.SetLabel("Cancelling…")
 
     # --- job = a set of connections; net-check and ratline-click both edit it ---
     def _conns_for_net(self, name):
@@ -786,17 +811,20 @@ class RouterDialog(wx.Dialog):
         return sub
 
     def _begin_route(self, label):
-        """Shared setup for a routing worker; returns (bp, debug, dbg, on_prog)."""
+        """Shared setup for a routing worker; returns (debug, dbg, on_prog)."""
         self._shown = []
+        self._cancel.clear()
         self.preview.set_proposed([])
         self.preview.set_explored(None, None)
         self.status.SetLabel(label)
         self.gauge.SetValue(0)
         self.gauge.Show()
-        self.panel.Layout()
-        self.btn_route.Disable()
-        self.btn_trunk.Disable()
+        self.tabs.Disable()
         self.net_list.Disable()
+        self.act_row.ShowItems(False)
+        self.btn_cancel.Show()
+        self.btn_cancel.Enable()
+        self.panel.Layout()
         debug = self.chk_debug.GetValue()
         dbg = {"cells": set(), "grid": None}
 
@@ -830,7 +858,8 @@ class RouterDialog(wx.Dialog):
             try:
                 results = router.route_batch(
                     self.board, names, sub, params, on_net=on_net,
-                    on_progress=(on_prog if debug else None))
+                    on_progress=(on_prog if debug else None),
+                    should_cancel=self._cancel.is_set)
                 wx.CallAfter(self._route_done, results,
                              dbg if debug else None)
             except Exception as e:  # noqa: BLE001
@@ -856,7 +885,8 @@ class RouterDialog(wx.Dialog):
         def worker():
             try:
                 r = router.auto_trunk(self.board, name, params,
-                                      on_progress=(on_prog if debug else None))
+                                      on_progress=(on_prog if debug else None),
+                                      should_cancel=self._cancel.is_set)
                 wx.CallAfter(self._route_done, [r], dbg if debug else None)
             except Exception as e:  # noqa: BLE001
                 wx.CallAfter(self._route_error,
@@ -896,8 +926,10 @@ class RouterDialog(wx.Dialog):
 
     def _finish_route(self):
         self.gauge.Hide()
-        self.panel.Layout()
+        self.btn_cancel.Hide()
         self.net_list.Enable()
+        self.tabs.Enable()
+        self.panel.Layout()
         self._update_route_enabled()
 
     def _route_error(self, text):
@@ -907,6 +939,7 @@ class RouterDialog(wx.Dialog):
 
     def _route_done(self, results, dbg=None):
         self._finish_route()
+        cancelled = self._cancel.is_set()
         self.proposed = results
         self.preview.set_proposed(results)
         if dbg is not None:
@@ -925,8 +958,11 @@ class RouterDialog(wx.Dialog):
             self.preview.zoom_to_bbox(min(xs), min(ys), max(xs), max(ys))
         seg = sum(len(r.get("segments", [])) for r in results)
         via = sum(len(r.get("vias", [])) for r in results)
+        if cancelled and seg == 0 and via == 0:
+            self.status.SetLabel("Cancelled.")
+            self._show_actions(False)
+            return
         if seg == 0 and via == 0:
-            self.btn_route.Enable()
             why = "\n".join("  %s: %s" % (r["net"], r.get("reason") or "no path")
                             for r in results if not r.get("ok"))
             self.status.SetLabel("Couldn't route — see details")

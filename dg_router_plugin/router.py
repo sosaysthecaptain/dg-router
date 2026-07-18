@@ -339,16 +339,21 @@ def nearest_free(cm, li, cell, max_rings=16):
 
 
 def astar(cm, starts, goal_cell, goal_layers, params, max_expansions=1_500_000,
-          on_progress=None, progress_every=600, goal_cells=None):
+          on_progress=None, progress_every=600, goal_cells=None, bounds=None,
+          should_cancel=None):
     """starts: list of (i,j,li). Goal reached at goal_cell on any goal layer,
     OR — if goal_cells (a set of (i,j,li)) is given — at any of those cells
     (route-to-copper: a branch joins an existing trunk wherever it's nearest).
-    Returns list of (i,j,li) or None. on_progress(cm, new_cells) is called
-    periodically with cells popped since the last call (for live animation)."""
+    bounds=(imin,imax,jmin,jmax) restricts the search to a corridor (much faster
+    for point-to-point nets; caller retries unbounded on failure).
+    should_cancel() aborts the search (returns None). Returns list of (i,j,li)
+    or None. on_progress(cm, new_cells) is called periodically."""
     gx, gy = goal_cell
     goalset = set(goal_layers)
     attract_bonus = 0.6
     new_cells = []
+    if bounds is not None:
+        bi0, bi1, bj0, bj1 = bounds
 
     def is_goal(ci, cj, cl):
         if goal_cells is not None:
@@ -383,6 +388,8 @@ def astar(cm, starts, goal_cell, goal_layers, params, max_expansions=1_500_000,
         seen += 1
         if seen > max_expansions:
             return None
+        if should_cancel is not None and (seen & 0x3FF) == 0 and should_cancel():
+            return None
         if on_progress:
             new_cells.append((ci, cj, cl))
             if len(new_cells) >= progress_every:
@@ -392,6 +399,8 @@ def astar(cm, starts, goal_cell, goal_layers, params, max_expansions=1_500_000,
         for nd, (di, dj) in enumerate(_DIRS):
             ni, nj = ci + di, cj + dj
             if not cm.in_bounds(ni, nj) or cm.blocked_at(cl, ni, nj):
+                continue
+            if bounds is not None and not (bi0 <= ni <= bi1 and bj0 <= nj <= bj1):
                 continue
             if di and dj:
                 if cm.blocked_at(cl, ci + di, cj) or cm.blocked_at(cl, ci, cj + dj):
@@ -1022,9 +1031,18 @@ def escape_pad(board, net_code, layer_id, li, px, py, pad_max, coarse_cm,
     return pts, coarse_cm.to_cell(ecx, ecy)
 
 
+def _corridor_bounds(cm, a_cell, b_cell):
+    """A search box around two cells + margin (tight for short nets, generous
+    for long ones). Speeds point-to-point A*; caller retries unbounded on fail."""
+    extent = max(abs(a_cell[0] - b_cell[0]), abs(a_cell[1] - b_cell[1]))
+    m = int(10.0 / cm.pitch) + extent // 3
+    return (min(a_cell[0], b_cell[0]) - m, max(a_cell[0], b_cell[0]) + m,
+            min(a_cell[1], b_cell[1]) - m, max(a_cell[1], b_cell[1]) + m)
+
+
 def route_net(board, net_name, gaps, params, prior_segments=None,
               prior_vias=None, attract_paths=None, on_progress=None,
-              avoid_points=None):
+              avoid_points=None, should_cancel=None):
     net = _find_net(board, net_name)
     if net is None:
         return {"net": net_name, "ok": False, "reason": "net not found"}
@@ -1076,8 +1094,20 @@ def route_net(board, net_name, gaps, params, prior_segments=None,
                 if not eg:
                     continue
                 eg_pts, eg_ec = eg
-                cells3 = astar(cm, [(es_ec[0], es_ec[1], sli)], eg_ec, [gli],
-                               params, on_progress=on_progress)
+                start3 = [(es_ec[0], es_ec[1], sli)]
+                bnd = _corridor_bounds(cm, es_ec, eg_ec)
+                # only bound when the corridor is meaningfully smaller than the
+                # board — else a long net would pay for a bounded search AND a
+                # full-board retry on failure
+                use = (bnd[1] - bnd[0] < cm.nx * 0.7
+                       or bnd[3] - bnd[2] < cm.ny * 0.7)
+                cells3 = astar(cm, start3, eg_ec, [gli], params,
+                               on_progress=on_progress, should_cancel=should_cancel,
+                               bounds=(bnd if use else None))
+                if not cells3 and use and not (should_cancel and should_cancel()):
+                    cells3 = astar(cm, start3, eg_ec, [gli], params,   # widen
+                                   on_progress=on_progress,
+                                   should_cancel=should_cancel)
                 if not cells3:
                     continue
                 # stitch: start fanout + coarse path + end fanout (reversed)
@@ -1151,7 +1181,7 @@ def _tree_diameter_path(pads, edges):
     return path
 
 
-def auto_trunk(board, net_name, params, on_progress=None):
+def auto_trunk(board, net_name, params, on_progress=None, should_cancel=None):
     """Power-style routing: route the net's MST-diameter as a trunk, then drop
     each remaining pin as a branch to the nearest trunk copper (route-to-copper).
     Returns one aggregated result, same shape as route_net."""
@@ -1180,7 +1210,8 @@ def auto_trunk(board, net_name, params, on_progress=None):
                    pads[spine[k + 1]][0], pads[spine[k + 1]][1])
                   for k in range(len(spine) - 1)]
 
-    res = route_net(board, net_name, trunk_gaps, params, on_progress=on_progress)
+    res = route_net(board, net_name, trunk_gaps, params, on_progress=on_progress,
+                    should_cancel=should_cancel)
     segments = list(res.get("segments", []))
     vias = list(res.get("vias", []))
     routed = res.get("routed", 0)
@@ -1205,6 +1236,8 @@ def auto_trunk(board, net_name, params, on_progress=None):
         return (sum(xs) // len(xs), sum(ys) // len(ys))
 
     for pi in [i for i in range(len(pads)) if i not in spine_set]:
+        if should_cancel is not None and should_cancel():
+            break
         px, py = pads[pi]
         total += 1
         pad = _pad_at(board, net_code, px, py)
@@ -1221,7 +1254,8 @@ def auto_trunk(board, net_name, params, on_progress=None):
             es_pts, es_ec = es
             cells3 = astar(cm, [(es_ec[0], es_ec[1], sli)], centroid(),
                            list(range(len(routable))), params,
-                           goal_cells=goal_cells, on_progress=on_progress)
+                           goal_cells=goal_cells, on_progress=on_progress,
+                           should_cancel=should_cancel)
             if not cells3:
                 continue
             runs, via_cells = split_layer_runs(cells3)
@@ -1286,7 +1320,8 @@ def refill_zones(board):
         pass
 
 
-def route_batch(board, net_names, unconn, params, on_progress=None, on_net=None):
+def route_batch(board, net_names, unconn, params, on_progress=None, on_net=None,
+                should_cancel=None):
     """Route a batch. Nets already routed this batch are (a) obstacles for the
     rest (no crossing/shorting) and (b) attractors (bus bundling). Longest net
     first anchors the bus. Does NOT mutate the board. on_net(done, total, result)
@@ -1311,6 +1346,8 @@ def route_batch(board, net_names, unconn, params, on_progress=None, on_net=None)
     prior_segments, prior_vias, attract = [], [], {}
     routed_names = set()
     for name in ordered:
+        if should_cancel is not None and should_cancel():
+            break
         gaps = unconn.get(name, [])
         if not gaps:
             r = {"net": name, "ok": True, "reason": "already routed",
@@ -1321,7 +1358,7 @@ def route_batch(board, net_names, unconn, params, on_progress=None, on_net=None)
             r = route_net(board, name, gaps, params,
                           prior_segments=prior_segments, prior_vias=prior_vias,
                           attract_paths=attract, on_progress=on_progress,
-                          avoid_points=avoid)
+                          avoid_points=avoid, should_cancel=should_cancel)
             routed_names.add(name)
             prior_segments += r.get("segments", [])
             prior_vias += r.get("vias", [])
