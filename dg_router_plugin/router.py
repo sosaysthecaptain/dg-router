@@ -551,6 +551,89 @@ def _pad_layers_at(board, net_code, x, y, routable):
     return best or list(routable)
 
 
+def _pad_at(board, net_code, x, y):
+    """(px, py, sx, sy) mm of the net's pad nearest (x, y)."""
+    best, bd = None, 1e18
+    for pad in board.GetPads():
+        if pad.GetNetCode() != net_code:
+            continue
+        p = pad.GetPosition()
+        d = math.hypot(p.x / _NM - x, p.y / _NM - y)
+        if d < bd:
+            bd = d
+            sz = pad.GetSize()
+            best = (p.x / _NM, p.y / _NM, sz.x / _NM, sz.y / _NM)
+    return best
+
+
+def _seg_hits_copper(board, net_code, layer_id, x1, y1, x2, y2):
+    """True if the segment crosses ANOTHER net's actual copper (a short) on
+    this layer. Grazing a clearance zone is fine — only real copper counts, so
+    a stub into a cramped pad connects (with a DRC clearance warning) but never
+    shorts. Proximity-filtered for speed."""
+    def d_seg(px, py):
+        dx, dy = x2 - x1, y2 - y1
+        L2 = dx * dx + dy * dy
+        t = 0.0 if L2 == 0 else max(0.0, min(1.0,
+                                             ((px - x1) * dx + (py - y1) * dy) / L2))
+        return math.hypot(px - (x1 + t * dx), py - (y1 + t * dy))
+
+    mx, my = (x1 + x2) / 2, (y1 + y2) / 2
+    seg_len = math.hypot(x2 - x1, y2 - y1)
+    reach = seg_len / 2 + 2.0
+    # dense samples of the segment, to test against (rotated) pad rectangles
+    ns = max(1, int(seg_len / 0.05))
+    samples = [(x1 + (x2 - x1) * k / ns, y1 + (y2 - y1) * k / ns)
+               for k in range(ns + 1)]
+    for pad in board.GetPads():
+        if pad.GetNetCode() == net_code or not pad.IsOnLayer(layer_id):
+            continue
+        p = pad.GetPosition()
+        px, py = p.x / _NM, p.y / _NM
+        if abs(px - mx) > reach or abs(py - my) > reach:
+            continue
+        sz = pad.GetSize()
+        hx, hy = sz.x / 2.0 / _NM, sz.y / 2.0 / _NM
+        try:
+            ang = math.radians(pad.GetOrientationDegrees())
+        except Exception:
+            ang = 0.0
+        ca, sa = math.cos(-ang), math.sin(-ang)
+        for (qx, qy) in samples:            # any sample inside the pad rect = short
+            dx, dy = qx - px, qy - py
+            if abs(dx * ca - dy * sa) <= hx and abs(dx * sa + dy * ca) <= hy:
+                return True
+    for t in board.GetTracks():
+        if t.GetNetCode() == net_code:
+            continue
+        if t.Type() == pcbnew.PCB_VIA_T:
+            p = t.GetPosition()
+            px, py = p.x / _NM, p.y / _NM
+            if abs(px - mx) <= reach and abs(py - my) <= reach:
+                if d_seg(px, py) < _via_width_mm(t, layer_id) / 2.0:
+                    return True
+        elif t.IsOnLayer(layer_id):
+            s, e = t.GetStart(), t.GetEnd()
+            sx, sy, ex, ey = s.x / _NM, s.y / _NM, e.x / _NM, e.y / _NM
+            if min(sx, ex) - reach > mx or max(sx, ex) + reach < mx:
+                continue
+            tw = t.GetWidth() / 2.0 / _NM
+            n = max(1, int(math.hypot(ex - sx, ey - sy) / 0.2))
+            for k in range(n + 1):
+                tt = k / n
+                if d_seg(sx + (ex - sx) * tt, sy + (ey - sy) * tt) < tw:
+                    return True
+    return False
+
+
+def _stub_ok(board, net_code, layer_id, pts):
+    for k in range(len(pts) - 1):
+        if _seg_hits_copper(board, net_code, layer_id,
+                            pts[k][0], pts[k][1], pts[k + 1][0], pts[k + 1][1]):
+            return False
+    return True
+
+
 def route_net(board, net_name, gaps, params, prior_segments=None,
               prior_vias=None, attract_paths=None, on_progress=None):
     net = _find_net(board, net_name)
@@ -576,23 +659,28 @@ def route_net(board, net_name, gaps, params, prior_segments=None,
     segments, vias, path_cells_by_layer = [], [], {}
     routed = 0
     for (x1, y1, x2, y2) in gaps:
-        ps = _pad_min_dim(board, net_code, x1, y1)
-        pe = _pad_min_dim(board, net_code, x2, y2)
-        # Enter each pad at a free cell WITHIN the pad copper — never with an
-        # unchecked stub across neighbors (that shorted adjacent pads). If the
-        # pad is boxed in at this resolution, skip the gap (fail, never short).
-        sr = max(1, int((ps or width) / 2.0 / params.pitch))
-        er = max(1, int((pe or width) / 2.0 / params.pitch))
+        spad = _pad_at(board, net_code, x1, y1)
+        epad = _pad_at(board, net_code, x2, y2)
+        ps = min(spad[2], spad[3]) if spad else width
+        pe = min(epad[2], epad[3]) if epad else width
+        # Search a GENEROUS area for each pad's escape cell (fine-pitch pads are
+        # boxed in — the only free cell is out one open side). Then connect with
+        # a copper-checked stub: it may graze clearance (a DRC warning) but never
+        # shorts, so cramped pads route instead of failing.
+        sr = int(((max(spad[2], spad[3]) / 2 if spad else width) + 1.5)
+                 / params.pitch)
+        er = int(((max(epad[2], epad[3]) / 2 if epad else width) + 1.5)
+                 / params.pitch)
         sl = [lidx[L] for L in _pad_layers_at(board, net_code, x1, y1, routable)]
         gl = [lidx[L] for L in _pad_layers_at(board, net_code, x2, y2, routable)]
         starts = []
         for li in sl:
-            c = nearest_free(cm, li, cm.to_cell(x1, y1), max_rings=sr)
+            c = nearest_free(cm, li, cm.to_cell(x1, y1), max_rings=max(2, sr))
             if c:
                 starts.append((c[0], c[1], li))
         goal_cell = None
         for li in gl:
-            c = nearest_free(cm, li, cm.to_cell(x2, y2), max_rings=er)
+            c = nearest_free(cm, li, cm.to_cell(x2, y2), max_rings=max(2, er))
             if c:
                 goal_cell = c
                 break
@@ -603,23 +691,38 @@ def route_net(board, net_name, gaps, params, prior_segments=None,
             continue
 
         runs, via_cells = split_layer_runs(cells3)
-        neck_s = max(params.min_track, min(width, ps)) if ps else width
-        neck_e = max(params.min_track, min(width, pe)) if pe else width
+        neck_s = max(params.min_track, min(width, ps))
+        neck_e = max(params.min_track, min(width, pe))
 
+        gap_segs, gap_cells, gap_ok = [], {}, True
         for ri, (li, run) in enumerate(runs):
-            path_cells_by_layer.setdefault(li, []).extend(run)
-            # octi_pull is collision-checked; endpoints already sit inside the
-            # pads, so there is NO unchecked stub -> cannot short.
             pts = octi_pull(cm, li, run)
+            if ri == 0:                       # connect the start pad
+                stub = _octi_stub((x1, y1), pts[0])
+                if not _stub_ok(board, net_code, routable[li], stub):
+                    gap_ok = False
+                    break
+                pts = stub[:-1] + pts
+            if ri == len(runs) - 1:           # connect the end pad
+                stub = _octi_stub((x2, y2), pts[-1])
+                if not _stub_ok(board, net_code, routable[li], stub):
+                    gap_ok = False
+                    break
+                pts = pts + stub[:-1][::-1]
             ns = neck_s if ri == 0 else width
             ne = neck_e if ri == len(runs) - 1 else width
-            segments += build_segments(pts, routable[li], width, ns, ne)
+            gap_segs += build_segments(pts, routable[li], width, ns, ne)
+            gap_cells.setdefault(li, []).extend(run)
+        if not gap_ok:
+            continue
 
+        segments += gap_segs
+        for li, cells in gap_cells.items():
+            path_cells_by_layer.setdefault(li, []).extend(cells)
         for (vi, vj) in via_cells:
             wx_, wy_ = cm.to_world(vi, vj)
             vias.append((wx_, wy_, via_dia, via_drill))
-            # stamp our own via so later gaps of THIS net don't stack on it
-            for li in range(len(cm.layers)):
+            for li in range(len(cm.layers)):   # our via blocks later gaps
                 cm._disc(cm.blocked[li], wx_, wy_, via_dia / 2.0 + cm.track_inflate)
             cm._disc(cm.via_blocked, wx_, wy_, via_dia / 2.0 + cm.via_inflate)
         routed += 1
