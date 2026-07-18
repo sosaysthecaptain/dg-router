@@ -78,6 +78,8 @@ class PreviewPanel(wx.Panel):
         self.Bind(wx.EVT_MOUSEWHEEL, self.on_wheel)
         self.Bind(wx.EVT_LEFT_DOWN, self.on_down)
         self.Bind(wx.EVT_LEFT_UP, self.on_up)
+        self.Bind(wx.EVT_MIDDLE_DOWN, self.on_down)   # middle-drag pans too
+        self.Bind(wx.EVT_MIDDLE_UP, self.on_up)
         self.Bind(wx.EVT_MOTION, self.on_motion)
         self.Bind(wx.EVT_SIZE, lambda e: (self.Refresh(), e.Skip()))
         # re-raster from the SVG at the zoom level (crisp like Mac Preview),
@@ -149,21 +151,12 @@ class PreviewPanel(wx.Panel):
         self._rtimer.StartOnce(140)
 
     def on_wheel(self, evt):
+        # KiCad: scroll up/down = zoom (around the cursor); drag = pan
         if self.bg_bmp is None:
             return
         d = evt.GetWheelRotation()
-        if evt.ControlDown() or evt.CmdDown():   # modifier + scroll = zoom
+        if d:
             self._zoom_at(1.2 if d > 0 else 1 / 1.2, evt.GetX(), evt.GetY())
-            return
-        # two-finger / wheel scroll = PAN (KiCad convention). No panning when
-        # fully zoomed out — the whole board is already in view.
-        if self.zoom <= 1.0:
-            return
-        if evt.GetWheelAxis() == wx.MOUSE_WHEEL_HORIZONTAL:
-            self.panx -= d
-        else:
-            self.pany += d
-        self.Refresh()
 
     def on_pinch(self, evt):
         if self.bg_bmp is None:
@@ -208,7 +201,8 @@ class PreviewPanel(wx.Panel):
         self._drag = None
 
     def on_motion(self, evt):
-        if self._drag and evt.Dragging() and evt.LeftIsDown():
+        if self._drag and evt.Dragging() and (evt.LeftIsDown() or
+                                              evt.MiddleIsDown()):
             x0, y0, px, py = self._drag
             self.panx = px + (evt.GetX() - x0)
             self.pany = py + (evt.GetY() - y0)
