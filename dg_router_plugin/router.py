@@ -185,6 +185,27 @@ class CostMap:
             t = s / steps
             self._disc(grid, x1 + (x2 - x1) * t, y1 + (y2 - y1) * t, r)
 
+    def _rect(self, grid, cx, cy, hx, hy, ang, val=1):
+        """Stamp a rotated rectangle (half-extents hx,hy already inflated).
+        Uses the true pad rectangle instead of a diagonal disc — a diagonal disc
+        balloons tall/narrow pads into big circles that seal escape corridors
+        between fine-pitch pads."""
+        p = self.pitch
+        rmax = math.hypot(hx, hy)
+        i0 = max(0, int((cx - rmax - self.x0) / p))
+        i1 = min(self.nx - 1, int((cx + rmax - self.x0) / p))
+        j0 = max(0, int((cy - rmax - self.y0) / p))
+        j1 = min(self.ny - 1, int((cy + rmax - self.y0) / p))
+        ca, sa = math.cos(-ang), math.sin(-ang)
+        for j in range(j0, j1 + 1):
+            wy = self.y0 + (j + 0.5) * p
+            row = j * self.nx
+            for i in range(i0, i1 + 1):
+                wx = self.x0 + (i + 0.5) * p
+                dx, dy = wx - cx, wy - cy
+                if abs(dx * ca - dy * sa) <= hx and abs(dx * sa + dy * ca) <= hy:
+                    grid[row + i] = val
+
     def _stamp_obstacles(self, board, net_code):
         tclr, vclr = self.track_inflate, self.via_inflate
         lset = set(self.layers)
@@ -194,12 +215,14 @@ class CostMap:
                 continue
             pos = pad.GetPosition()
             sz = pad.GetSize()
-            rr = math.hypot(sz.x, sz.y) / 2.0 / _NM
-            self._disc(self.via_blocked, pos.x / _NM, pos.y / _NM, rr + vclr)
+            hx, hy = sz.x / 2.0 / _NM, sz.y / 2.0 / _NM
+            ang = _safe(lambda: pad.GetOrientation().AsRadians(), 0.0)
+            px, py = pos.x / _NM, pos.y / _NM
+            self._rect(self.via_blocked, px, py, hx + vclr, hy + vclr, ang)
             for L in self.layers:
                 if pad.IsOnLayer(L):
-                    self._disc(self.blocked[lidx[L]], pos.x / _NM, pos.y / _NM,
-                               rr + tclr)
+                    self._rect(self.blocked[lidx[L]], px, py,
+                               hx + tclr, hy + tclr, ang)
         for t in board.GetTracks():
             if t.GetNetCode() == net_code:
                 continue
@@ -634,6 +657,253 @@ def _stub_ok(board, net_code, layer_id, pts):
     return True
 
 
+# --- local fine-grid pad fanout -------------------------------------------
+# Coarse A* can't thread into fine-pitch pads (the channel is < one coarse
+# cell). So around each pad we build a small FINE grid, escape out of the pad
+# to a point that is free on the COARSE grid, and hand off to the coarse router.
+# The whole route stays clearance-clean (no grazing stub).
+
+class LocalGrid:
+    def __init__(self, board, layer_id, net_code, cx, cy, half, pitch, inflate,
+                 prior_segments=None, prior_vias=None):
+        self.pitch = pitch
+        self.x0 = cx - half
+        self.y0 = cy - half
+        self.nx = max(1, int(2 * half / pitch) + 1)
+        self.ny = self.nx
+        self.blocked = bytearray(self.nx * self.ny)
+        self._stamp(board, layer_id, net_code, inflate)
+        self._stamp_prior(layer_id, inflate, prior_segments, prior_vias)
+        # Our own pads are copper we're allowed to land on — a track there is not
+        # a short. Clear them LAST so a neighbor's clearance inflation (which
+        # bleeds across fine pad pitches) never blocks our own escape start.
+        self._clear_own_pads(board, layer_id, net_code)
+
+    def in_bounds(self, i, j):
+        return 0 <= i < self.nx and 0 <= j < self.ny
+
+    def is_blocked(self, i, j):
+        return self.blocked[j * self.nx + i]
+
+    def to_cell(self, x, y):
+        return (int((x - self.x0) / self.pitch), int((y - self.y0) / self.pitch))
+
+    def to_world(self, i, j):
+        return (self.x0 + (i + 0.5) * self.pitch, self.y0 + (j + 0.5) * self.pitch)
+
+    def _disc(self, cx, cy, r):
+        p = self.pitch
+        i0 = max(0, int((cx - r - self.x0) / p))
+        i1 = min(self.nx - 1, int((cx + r - self.x0) / p))
+        j0 = max(0, int((cy - r - self.y0) / p))
+        j1 = min(self.ny - 1, int((cy + r - self.y0) / p))
+        r2 = r * r
+        for j in range(j0, j1 + 1):
+            wy = self.y0 + (j + 0.5) * p
+            row = j * self.nx
+            for i in range(i0, i1 + 1):
+                wx = self.x0 + (i + 0.5) * p
+                if (wx - cx) ** 2 + (wy - cy) ** 2 <= r2:
+                    self.blocked[row + i] = 1
+
+    def _seg(self, x1, y1, x2, y2, r):
+        length = math.hypot(x2 - x1, y2 - y1)
+        n = max(1, int(length / (self.pitch * 0.5)))
+        for s in range(n + 1):
+            t = s / n
+            self._disc(x1 + (x2 - x1) * t, y1 + (y2 - y1) * t, r)
+
+    def _stamp(self, board, layer_id, net_code, inflate):
+        wx0, wy0 = self.x0, self.y0
+        wx1 = self.x0 + self.nx * self.pitch
+        wy1 = self.y0 + self.ny * self.pitch
+        m = inflate + 1.0
+        for pad in board.GetPads():
+            if pad.GetNetCode() == net_code or not pad.IsOnLayer(layer_id):
+                continue
+            p = pad.GetPosition()
+            px, py = p.x / _NM, p.y / _NM
+            if px < wx0 - m or px > wx1 + m or py < wy0 - m or py > wy1 + m:
+                continue
+            sz = pad.GetSize()
+            ang = _safe(lambda: pad.GetOrientation().AsRadians(), 0.0)
+            self._rect(px, py, sz.x / 2.0 / _NM + inflate,
+                       sz.y / 2.0 / _NM + inflate, ang, 1)
+        for t in board.GetTracks():
+            if t.GetNetCode() == net_code:
+                continue
+            if t.Type() == pcbnew.PCB_VIA_T:
+                p = t.GetPosition()
+                px, py = p.x / _NM, p.y / _NM
+                if wx0 - m < px < wx1 + m and wy0 - m < py < wy1 + m:
+                    self._disc(px, py, _via_width_mm(t, layer_id) / 2.0 + inflate)
+            elif t.IsOnLayer(layer_id):
+                s, e = t.GetStart(), t.GetEnd()
+                sx, sy, ex, ey = s.x / _NM, s.y / _NM, e.x / _NM, e.y / _NM
+                if (max(sx, ex) < wx0 - m or min(sx, ex) > wx1 + m
+                        or max(sy, ey) < wy0 - m or min(sy, ey) > wy1 + m):
+                    continue
+                self._seg(sx, sy, ex, ey, t.GetWidth() / 2.0 / _NM + inflate)
+
+    def _rect(self, cx, cy, hx, hy, ang_rad, val):
+        """Set cells whose center is inside a (possibly rotated) rectangle to
+        `val` (1=block, 0=clear). Half-extents are pre-inflated by the caller."""
+        p = self.pitch
+        rmax = math.hypot(hx, hy)
+        i0 = max(0, int((cx - rmax - self.x0) / p))
+        i1 = min(self.nx - 1, int((cx + rmax - self.x0) / p))
+        j0 = max(0, int((cy - rmax - self.y0) / p))
+        j1 = min(self.ny - 1, int((cy + rmax - self.y0) / p))
+        ca, sa = math.cos(-ang_rad), math.sin(-ang_rad)
+        for j in range(j0, j1 + 1):
+            wy = self.y0 + (j + 0.5) * p
+            row = j * self.nx
+            for i in range(i0, i1 + 1):
+                wx = self.x0 + (i + 0.5) * p
+                dx, dy = wx - cx, wy - cy
+                if abs(dx * ca - dy * sa) <= hx and abs(dx * sa + dy * ca) <= hy:
+                    self.blocked[row + i] = val
+
+    def _clear_own_pads(self, board, layer_id, net_code):
+        wx0, wy0 = self.x0, self.y0
+        wx1 = self.x0 + self.nx * self.pitch
+        wy1 = self.y0 + self.ny * self.pitch
+        for pad in board.GetPads():
+            if pad.GetNetCode() != net_code or not pad.IsOnLayer(layer_id):
+                continue
+            p = pad.GetPosition()
+            px, py = p.x / _NM, p.y / _NM
+            if px < wx0 - 1 or px > wx1 + 1 or py < wy0 - 1 or py > wy1 + 1:
+                continue
+            sz = pad.GetSize()
+            ang = _safe(lambda: pad.GetOrientation().AsRadians(), 0.0)
+            self._rect(px, py, sz.x / 2.0 / _NM, sz.y / 2.0 / _NM, ang, 0)
+
+    def _stamp_prior(self, layer_id, inflate, prior_segments, prior_vias):
+        """Stamp sibling nets' PROPOSED (preview-only) copper. These are never
+        on the board, so _stamp can't see them — but a fanout escape must still
+        avoid them or same-batch nets short."""
+        wx0, wy0 = self.x0, self.y0
+        wx1 = self.x0 + self.nx * self.pitch
+        wy1 = self.y0 + self.ny * self.pitch
+        m = inflate + 1.0
+        for (sx, sy, ex, ey, w, seg_layer) in (prior_segments or []):
+            if seg_layer != layer_id:
+                continue
+            if (max(sx, ex) < wx0 - m or min(sx, ex) > wx1 + m
+                    or max(sy, ey) < wy0 - m or min(sy, ey) > wy1 + m):
+                continue
+            self._seg(sx, sy, ex, ey, w / 2.0 + inflate)
+        for (vx, vy, dia, _drill) in (prior_vias or []):     # through-vias: all layers
+            if wx0 - m < vx < wx1 + m and wy0 - m < vy < wy1 + m:
+                self._disc(vx, vy, dia / 2.0 + inflate)
+
+
+def _lg_nearest_free(lg, cell, rings):
+    ci, cj = cell
+    if lg.in_bounds(ci, cj) and not lg.is_blocked(ci, cj):
+        return cell
+    for r in range(1, rings + 1):
+        for di in range(-r, r + 1):
+            for dj in (-r, r):
+                i, j = ci + di, cj + dj
+                if lg.in_bounds(i, j) and not lg.is_blocked(i, j):
+                    return (i, j)
+        for dj in range(-r + 1, r):
+            for di in (-r, r):
+                i, j = ci + di, cj + dj
+                if lg.in_bounds(i, j) and not lg.is_blocked(i, j):
+                    return (i, j)
+    return None
+
+
+def _local_astar(lg, start, is_goal, max_expansions=250_000):
+    if lg.is_blocked(*start):
+        return None
+    open_heap = [(0.0, start)]
+    g = {start: 0.0}
+    came = {}
+    seen = 0
+    while open_heap:
+        gc, cur = heapq.heappop(open_heap)
+        if is_goal(*cur):
+            return _reconstruct2(came, cur)
+        if gc > g.get(cur, 1e18):
+            continue
+        seen += 1
+        if seen > max_expansions:
+            return None
+        ci, cj = cur
+        for di, dj in _DIRS:
+            ni, nj = ci + di, cj + dj
+            if not lg.in_bounds(ni, nj) or lg.is_blocked(ni, nj):
+                continue
+            if di and dj and (lg.is_blocked(ci + di, cj) and lg.is_blocked(ci, cj + dj)):
+                continue
+            ng = gc + (math.sqrt(2) if di and dj else 1.0)
+            nxt = (ni, nj)
+            if ng < g.get(nxt, 1e18):
+                g[nxt] = ng
+                came[nxt] = cur
+                heapq.heappush(open_heap, (ng, nxt))
+    return None
+
+
+def _reconstruct2(came, cur):
+    out = [cur]
+    while cur in came:
+        cur = came[cur]
+        out.append(cur)
+    out.reverse()
+    return out
+
+
+def _merge_collinear(cells):
+    if len(cells) <= 2:
+        return list(cells)
+    keep = [cells[0]]
+    prev = (_sgn(cells[1][0] - cells[0][0]), _sgn(cells[1][1] - cells[0][1]))
+    for k in range(1, len(cells) - 1):
+        d = (_sgn(cells[k + 1][0] - cells[k][0]),
+             _sgn(cells[k + 1][1] - cells[k][1]))
+        if d != prev:
+            keep.append(cells[k])
+            prev = d
+    keep.append(cells[-1])
+    return keep
+
+
+def escape_pad(board, net_code, layer_id, li, px, py, pad_max, coarse_cm,
+               fine_pitch, inflate, prior_segments=None, prior_vias=None):
+    """Route out of a pad on a fine local grid to a point that's free on the
+    coarse grid. Returns (fine_world_path [pad..escape], escape_coarse_cell) or
+    None if the pad can't be escaped."""
+    half = pad_max / 2.0 + 3.0
+    lg = LocalGrid(board, layer_id, net_code, px, py, half, fine_pitch, inflate,
+                   prior_segments=prior_segments, prior_vias=prior_vias)
+    start = lg.to_cell(px, py)
+    if lg.is_blocked(*start):
+        start = _lg_nearest_free(lg, start, int(pad_max / fine_pitch) + 2)
+        if start is None:
+            return None
+    esc2 = (pad_max / 2.0 + 0.35) ** 2
+
+    def is_goal(i, j):
+        wx, wy = lg.to_world(i, j)
+        if (wx - px) ** 2 + (wy - py) ** 2 < esc2:
+            return False
+        ci, cj = coarse_cm.to_cell(wx, wy)
+        return coarse_cm.in_bounds(ci, cj) and not coarse_cm.blocked_at(li, ci, cj)
+
+    cells = _local_astar(lg, start, is_goal)
+    if not cells:
+        return None
+    pts = [lg.to_world(*c) for c in _merge_collinear(cells)]
+    pts[0] = (px, py)
+    ecx, ecy = lg.to_world(*cells[-1])
+    return pts, coarse_cm.to_cell(ecx, ecy)
+
+
 def route_net(board, net_name, gaps, params, prior_segments=None,
               prior_vias=None, attract_paths=None, on_progress=None):
     net = _find_net(board, net_name)
@@ -656,76 +926,67 @@ def route_net(board, net_name, gaps, params, prior_segments=None,
             cm.compute_dist(li)
     lidx = {L: k for k, L in enumerate(routable)}
 
+    fine_inflate = clearance + width / 2.0 + 0.04
     segments, vias, path_cells_by_layer = [], [], {}
     routed = 0
     for (x1, y1, x2, y2) in gaps:
         spad = _pad_at(board, net_code, x1, y1)
         epad = _pad_at(board, net_code, x2, y2)
-        ps = min(spad[2], spad[3]) if spad else width
-        pe = min(epad[2], epad[3]) if epad else width
-        # Search a GENEROUS area for each pad's escape cell (fine-pitch pads are
-        # boxed in — the only free cell is out one open side). Then connect with
-        # a copper-checked stub: it may graze clearance (a DRC warning) but never
-        # shorts, so cramped pads route instead of failing.
-        sr = int(((max(spad[2], spad[3]) / 2 if spad else width) + 1.5)
-                 / params.pitch)
-        er = int(((max(epad[2], epad[3]) / 2 if epad else width) + 1.5)
-                 / params.pitch)
+        if not spad or not epad:
+            continue
+        smax, emax = max(spad[2], spad[3]), max(epad[2], epad[3])
+        neck_s = max(params.min_track, min(spad[2], spad[3]))
+        neck_e = max(params.min_track, min(epad[2], epad[3]))
         sl = [lidx[L] for L in _pad_layers_at(board, net_code, x1, y1, routable)]
         gl = [lidx[L] for L in _pad_layers_at(board, net_code, x2, y2, routable)]
-        starts = []
-        for li in sl:
-            c = nearest_free(cm, li, cm.to_cell(x1, y1), max_rings=max(2, sr))
-            if c:
-                starts.append((c[0], c[1], li))
-        goal_cell = None
-        for li in gl:
-            c = nearest_free(cm, li, cm.to_cell(x2, y2), max_rings=max(2, er))
-            if c:
-                goal_cell = c
+
+        gap_ok = False
+        for sli in sl:
+            es = escape_pad(board, net_code, routable[sli], sli, x1, y1, smax,
+                            cm, 0.05, fine_inflate,
+                            prior_segments=prior_segments, prior_vias=prior_vias)
+            if not es:
+                continue
+            es_pts, es_ec = es
+            for gli in gl:
+                eg = escape_pad(board, net_code, routable[gli], gli, x2, y2, emax,
+                                cm, 0.05, fine_inflate,
+                                prior_segments=prior_segments, prior_vias=prior_vias)
+                if not eg:
+                    continue
+                eg_pts, eg_ec = eg
+                cells3 = astar(cm, [(es_ec[0], es_ec[1], sli)], eg_ec, [gli],
+                               params, on_progress=on_progress)
+                if not cells3:
+                    continue
+                # stitch: start fanout + coarse path + end fanout (reversed)
+                runs, via_cells = split_layer_runs(cells3)
+                gap_segs, gap_cells = [], {}
+                for ri, (li, run) in enumerate(runs):
+                    cpoly = octi_pull(cm, li, run)
+                    if ri == 0:
+                        cpoly = es_pts[:-1] + cpoly
+                    if ri == len(runs) - 1:
+                        cpoly = cpoly + eg_pts[::-1][1:]
+                    ns = neck_s if ri == 0 else width
+                    ne = neck_e if ri == len(runs) - 1 else width
+                    gap_segs += build_segments(cpoly, routable[li], width, ns, ne)
+                    gap_cells.setdefault(li, []).extend(run)
+                segments += gap_segs
+                for li, cells in gap_cells.items():
+                    path_cells_by_layer.setdefault(li, []).extend(cells)
+                for (vi, vj) in via_cells:
+                    wx_, wy_ = cm.to_world(vi, vj)
+                    vias.append((wx_, wy_, via_dia, via_drill))
+                    for li in range(len(cm.layers)):
+                        cm._disc(cm.blocked[li], wx_, wy_,
+                                 via_dia / 2.0 + cm.track_inflate)
+                    cm._disc(cm.via_blocked, wx_, wy_, via_dia / 2.0 + cm.via_inflate)
+                routed += 1
+                gap_ok = True
                 break
-        if not starts or goal_cell is None:
-            continue
-        cells3 = astar(cm, starts, goal_cell, gl, params, on_progress=on_progress)
-        if not cells3:
-            continue
-
-        runs, via_cells = split_layer_runs(cells3)
-        neck_s = max(params.min_track, min(width, ps))
-        neck_e = max(params.min_track, min(width, pe))
-
-        gap_segs, gap_cells, gap_ok = [], {}, True
-        for ri, (li, run) in enumerate(runs):
-            pts = octi_pull(cm, li, run)
-            if ri == 0:                       # connect the start pad
-                stub = _octi_stub((x1, y1), pts[0])
-                if not _stub_ok(board, net_code, routable[li], stub):
-                    gap_ok = False
-                    break
-                pts = stub[:-1] + pts
-            if ri == len(runs) - 1:           # connect the end pad
-                stub = _octi_stub((x2, y2), pts[-1])
-                if not _stub_ok(board, net_code, routable[li], stub):
-                    gap_ok = False
-                    break
-                pts = pts + stub[:-1][::-1]
-            ns = neck_s if ri == 0 else width
-            ne = neck_e if ri == len(runs) - 1 else width
-            gap_segs += build_segments(pts, routable[li], width, ns, ne)
-            gap_cells.setdefault(li, []).extend(run)
-        if not gap_ok:
-            continue
-
-        segments += gap_segs
-        for li, cells in gap_cells.items():
-            path_cells_by_layer.setdefault(li, []).extend(cells)
-        for (vi, vj) in via_cells:
-            wx_, wy_ = cm.to_world(vi, vj)
-            vias.append((wx_, wy_, via_dia, via_drill))
-            for li in range(len(cm.layers)):   # our via blocks later gaps
-                cm._disc(cm.blocked[li], wx_, wy_, via_dia / 2.0 + cm.track_inflate)
-            cm._disc(cm.via_blocked, wx_, wy_, via_dia / 2.0 + cm.via_inflate)
-        routed += 1
+            if gap_ok:
+                break
 
     return {"net": net_name, "ok": routed == len(gaps) and len(gaps) > 0,
             "gaps": len(gaps), "routed": routed, "segments": segments,

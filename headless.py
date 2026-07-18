@@ -93,6 +93,17 @@ def main(argv=None):
             layer_names=[s.strip() for s in args.layers.split(",") if s.strip()],
             objective=args.objective, prefer_layer=args.prefer)
         summary = router.solve(args.board, args.route, out, params=params)
+        # Copy the sibling .kicad_pro so DRC / KiCad read the board's REAL rules
+        # (netclass clearances live in the project file; without it KiCad falls
+        # back to a 0.2mm default clearance and reports phantom violations).
+        import shutil
+        src_pro = os.path.splitext(os.path.abspath(args.board))[0] + ".kicad_pro"
+        if os.path.exists(src_pro):
+            try:
+                shutil.copyfile(src_pro,
+                                os.path.join(out_dir, "routed.kicad_pro"))
+            except OSError:
+                pass
         for r in summary["results"]:
             print("  %-22s ok=%s  %s" % (
                 r["net"], r["ok"],
