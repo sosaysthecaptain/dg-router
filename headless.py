@@ -42,7 +42,7 @@ def main(argv=None):
     ap.add_argument("--solve", action="store_true",
                     help="actually route --route nets, write a copy, DRC-verify")
     ap.add_argument("--pitch", type=float, default=0.2, help="grid pitch mm")
-    ap.add_argument("--route-via-cost", type=float, default=25.0,
+    ap.add_argument("--route-via-cost", type=float, default=10.0,
                     help="A* cost (grid steps) per via")
     ap.add_argument("--layers", default="F.Cu,B.Cu",
                     help="comma-separated routable copper layers")

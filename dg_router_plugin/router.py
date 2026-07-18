@@ -61,7 +61,7 @@ def _via_width_mm(via, layer):
 
 
 class RouteParams:
-    def __init__(self, board, pitch_mm=0.2, turn_cost=0.7, via_cost=25.0,
+    def __init__(self, board, pitch_mm=0.2, turn_cost=0.7, via_cost=10.0,
                  layer_names=None, seed=0, jitter=0.0):
         ds = board.GetDesignSettings()
         self.pitch = pitch_mm

@@ -332,7 +332,7 @@ class RouterDialog(wx.Dialog):
         grid.AddGrowableCol(1, 1)
         grid.Add(wx.StaticText(panel, label="Via cost:"),
                  0, wx.ALIGN_CENTER_VERTICAL)
-        self.via_cost = wx.Slider(panel, value=25, minValue=0, maxValue=200,
+        self.via_cost = wx.Slider(panel, value=10, minValue=0, maxValue=100,
                                   style=wx.SL_HORIZONTAL | wx.SL_LABELS)
         grid.Add(self.via_cost, 0, wx.EXPAND)
         grid.Add(wx.StaticText(panel, label="Edge hug (0-100):"),
