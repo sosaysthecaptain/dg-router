@@ -326,6 +326,52 @@ def render_board_png(board_path, out_png, layers=None, ppm=12.0):
     return out_png
 
 
+def net_at_point(board, x_mm, y_mm, tol_mm=0.5):
+    """Net name of the pad (or track) at a board point, or None. Used to select
+    a net by clicking its pad in the preview. Pads win over tracks; nearest wins.
+    Rotated pads are tested in the pad's own frame."""
+    import pcbnew
+
+    best_name, best_d = None, 1e18
+    for pad in board.GetPads():
+        p = pad.GetPosition()
+        px, py = p.x / _NM, p.y / _NM
+        sz = pad.GetSize()
+        hx, hy = sz.x / 2.0 / _NM + tol_mm, sz.y / 2.0 / _NM + tol_mm
+        try:
+            ang = pad.GetOrientation().AsRadians()
+        except Exception:
+            ang = 0.0
+        dx, dy = x_mm - px, y_mm - py
+        ca, sa = math.cos(-ang), math.sin(-ang)
+        lx, ly = dx * ca - dy * sa, dx * sa + dy * ca
+        if abs(lx) <= hx and abs(ly) <= hy:
+            d = lx * lx + ly * ly
+            nm = pad.GetNetname()
+            if nm and d < best_d:
+                best_d, best_name = d, nm
+    if best_name:
+        return best_name
+
+    # fall back to the nearest track within tolerance
+    for t in board.GetTracks():
+        if t.Type() == pcbnew.PCB_VIA_T:
+            continue
+        s, e = t.GetStart(), t.GetEnd()
+        sx, sy, ex, ey = s.x / _NM, s.y / _NM, e.x / _NM, e.y / _NM
+        vx, vy = ex - sx, ey - sy
+        L = vx * vx + vy * vy
+        tt = 0.0 if L == 0 else max(0.0, min(1.0, ((x_mm - sx) * vx +
+                                                   (y_mm - sy) * vy) / L))
+        cx, cy = sx + tt * vx, sy + tt * vy
+        d = math.hypot(x_mm - cx, y_mm - cy)
+        thr = t.GetWidth() / 2.0 / _NM + tol_mm
+        if d <= thr and d < best_d:
+            best_d = d
+            best_name = t.GetNetname()
+    return best_name
+
+
 def build_job(route_nets, prefer, avoid=None, follow_existing=True,
               expendable=None, then=None):
     """Build a job-spec dict (the interchange the TS router core will consume)."""

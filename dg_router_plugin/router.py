@@ -68,6 +68,8 @@ class RouteParams:
         self.pitch = pitch_mm
         self.turn_cost = turn_cost
         self.via_cost = via_cost           # extra A* cost (grid steps) per via
+        self.pad_via_penalty = 20.0        # extra cost for a via hugging a pad
+        self.repel_cost = 2.5              # cost to cross another pin's fanout
         # routing objective (cost-term preset): direct | follow | hug |
         # least_obtrusive. least_obtrusive hugs edges/copper and avoids grabbing
         # open territory (keeps it from walling off chips).
@@ -120,6 +122,8 @@ class CostMap:
         self.blocked = [bytearray(n) for _ in self.layers]
         self.via_blocked = bytearray(n)
         self.attract = [bytearray(n) for _ in self.layers]  # bus bundling bonus
+        self.near_pad = bytearray(n)   # cells hugging a pad -> discourage vias here
+        self.repel = bytearray(n)      # steer clear of others' unrouted fanout
         self.dist = [None for _ in self.layers]  # dist-to-nearest-obstacle (cells)
         # clearance + width/2 is the true minimum; add a full cell of
         # discretization safety so cell-center paths never violate clearance.
@@ -219,6 +223,7 @@ class CostMap:
             ang = _safe(lambda: pad.GetOrientation().AsRadians(), 0.0)
             px, py = pos.x / _NM, pos.y / _NM
             self._rect(self.via_blocked, px, py, hx + vclr, hy + vclr, ang)
+            self._disc(self.near_pad, px, py, math.hypot(hx, hy) + 1.0)
             for L in self.layers:
                 if pad.IsOnLayer(L):
                     self._rect(self.blocked[lidx[L]], px, py,
@@ -302,6 +307,12 @@ class CostMap:
                     if self.in_bounds(ii, jj):
                         g[self.idx(ii, jj)] = bonus
 
+    def add_repulsion_world(self, cx, cy, radius_mm):
+        """Mark a disc as costly-to-cross (all layers). Used to steer clear of
+        the fanout space of OTHER pins that still need routing, so we don't wall
+        in work that's coming."""
+        self._disc(self.repel, cx, cy, radius_mm)
+
 
 # --- 3D A* (x, y, layer) + octilinear reduction ----------------------------
 
@@ -381,6 +392,8 @@ def astar(cm, starts, goal_cell, goal_layers, params, max_expansions=1_500_000,
             cost = step + turn * params.turn_cost
             if cm.attract[cl][cm.idx(ni, nj)]:
                 cost = max(0.1, cost - attract_bonus)
+            if cm.repel[cm.idx(ni, nj)]:        # keep clear of others' fanout
+                cost += params.repel_cost
             obj = params.objective
             if obj == "least_obtrusive":       # avoid open space; hug stuff
                 cost += 0.06 * cm.dist_at(cl, ni, nj)
@@ -403,10 +416,12 @@ def astar(cm, starts, goal_cell, goal_layers, params, max_expansions=1_500_000,
                 heapq.heappush(open_heap, (ng + h(ni, nj), ng, key))
         # via moves (change layer, same cell)
         if nlayers > 1 and cm.via_ok(ci, cj):
+            via_extra = (params.pad_via_penalty
+                         if cm.near_pad[cm.idx(ci, cj)] else 0.0)
             for nl in range(nlayers):
                 if nl == cl or cm.blocked_at(nl, ci, cj):
                     continue
-                ng = gc + params.via_cost
+                ng = gc + params.via_cost + via_extra
                 key = (ci, cj, nl, cd)
                 if ng < g.get(key, 1e18):
                     g[key] = ng
@@ -488,6 +503,45 @@ def octi_pull(cm, li, cells):
         out.append(cells[best])
         i = best
     return [cm.to_world(*c) for c in out]
+
+
+def _seg_clear_lg(lg, a, b):
+    """Is the octilinear segment a->b free on the fine LocalGrid?"""
+    x, y = a
+    dx, dy = _sgn(b[0] - a[0]), _sgn(b[1] - a[1])
+    n = max(abs(b[0] - a[0]), abs(b[1] - a[1]))
+    for _ in range(n + 1):
+        if not lg.in_bounds(x, y) or lg.is_blocked(x, y):
+            return False
+        if dx and dy and lg.is_blocked(x + dx, y) and lg.is_blocked(x, y + dy):
+            return False
+        x += dx
+        y += dy
+    return True
+
+
+def _octi_pull_lg(lg, cells):
+    """Octilinear string-pull on the fine LocalGrid — same greedy L-collapse as
+    octi_pull, so the escape leaves the pad in clean 45deg segments instead of a
+    grid staircase (kills the one-cell kink at the fine/coarse seam)."""
+    if len(cells) <= 2:
+        return [lg.to_world(*c) for c in cells]
+    out = [cells[0]]
+    i = 0
+    while i < len(cells) - 1:
+        best = i + 1
+        for j in range(len(cells) - 1, i, -1):
+            corner = _octi_corner(cells[i], cells[j])
+            if _seg_clear_lg(lg, cells[i], corner) and \
+               _seg_clear_lg(lg, corner, cells[j]):
+                best = j
+                break
+        corner = _octi_corner(cells[i], cells[best])
+        if corner != cells[i] and corner != cells[best]:
+            out.append(corner)
+        out.append(cells[best])
+        i = best
+    return [lg.to_world(*c) for c in out]
 
 
 # --- pad entry + neck-down --------------------------------------------------
@@ -898,14 +952,15 @@ def escape_pad(board, net_code, layer_id, li, px, py, pad_max, coarse_cm,
     cells = _local_astar(lg, start, is_goal)
     if not cells:
         return None
-    pts = [lg.to_world(*c) for c in _merge_collinear(cells)]
+    pts = _octi_pull_lg(lg, cells)      # clean octilinear escape, no staircase
     pts[0] = (px, py)
     ecx, ecy = lg.to_world(*cells[-1])
     return pts, coarse_cm.to_cell(ecx, ecy)
 
 
 def route_net(board, net_name, gaps, params, prior_segments=None,
-              prior_vias=None, attract_paths=None, on_progress=None):
+              prior_vias=None, attract_paths=None, on_progress=None,
+              avoid_points=None):
     net = _find_net(board, net_name)
     if net is None:
         return {"net": net_name, "ok": False, "reason": "net not found"}
@@ -921,6 +976,8 @@ def route_net(board, net_name, gaps, params, prior_segments=None,
     if attract_paths:
         for li, cells in attract_paths.items():
             cm.add_attraction(li, cells)
+    for (ax, ay) in (avoid_points or []):   # others' unrouted fanout — steer clear
+        cm.add_repulsion_world(ax, ay, 0.6)
     if params.objective in ("least_obtrusive", "follow"):
         for li in range(len(routable)):
             cm.compute_dist(li)
@@ -1041,17 +1098,32 @@ def route_batch(board, net_names, unconn, params, on_progress=None, on_net=None)
     ordered = sorted(net_names, key=gap_len, reverse=True)
     total = len(ordered)
 
+    # Every unrouted pin is a fanout that someone will need — repel other nets
+    # away from each one so we don't wall in work that's coming.
+    endpoints = {}   # net name -> [(x,y), ...] of its unrouted pins
+    for oname, gs in unconn.items():
+        pts = []
+        for g in gs:
+            pts.append((g[0], g[1]))
+            pts.append((g[2], g[3]))
+        endpoints[oname] = pts
+
     results = []
     prior_segments, prior_vias, attract = [], [], {}
+    routed_names = set()
     for name in ordered:
         gaps = unconn.get(name, [])
         if not gaps:
             r = {"net": name, "ok": True, "reason": "already routed",
                  "gaps": 0, "routed": 0, "segments": [], "vias": []}
         else:
+            avoid = [pt for onm, pts in endpoints.items()
+                     if onm != name and onm not in routed_names for pt in pts]
             r = route_net(board, name, gaps, params,
                           prior_segments=prior_segments, prior_vias=prior_vias,
-                          attract_paths=attract, on_progress=on_progress)
+                          attract_paths=attract, on_progress=on_progress,
+                          avoid_points=avoid)
+            routed_names.add(name)
             prior_segments += r.get("segments", [])
             prior_vias += r.get("vias", [])
             for li, cells in r.get("path_cells", {}).items():

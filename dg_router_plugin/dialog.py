@@ -30,10 +30,13 @@ _C_PAD = wx.Colour(255, 235, 59)
 _C_KEPT = wx.Colour(75, 222, 128)         # existing same-net copper
 _C_TODO = wx.Colour(255, 62, 165)         # ratlines of a checked net (magenta)
 _C_ACTIVE = wx.Colour(120, 245, 255)      # ratlines of the ACTIVE net (brighter)
-_C_PROP = {pcbnew.F_Cu: wx.Colour(0, 229, 255),
-           pcbnew.B_Cu: wx.Colour(255, 150, 0)}
+# proposed routes drawn in the board's own layer colors (F.Cu red, B.Cu blue)
+# so you can read at a glance which layer a track lands on
+_C_PROP = {pcbnew.F_Cu: wx.Colour(235, 70, 70),
+           pcbnew.B_Cu: wx.Colour(70, 135, 245)}
 _C_PROP_DEFAULT = wx.Colour(230, 230, 230)
 _C_PROP_VIA = wx.Colour(255, 235, 59)
+_C_DEBUG = wx.Colour(120, 245, 255)       # A* explored-cell heatmap
 _BG = wx.Colour(24, 24, 24)
 _C_EDGE = wx.Colour(210, 210, 70)         # board outline (KiCad edge-cuts yellow)
 _BG_PPM = 30.0                            # base render resolution (px per mm)
@@ -64,6 +67,11 @@ class PreviewPanel(wx.Panel):
         self.unconn = {}
         self.status_loaded = False
         self.proposed = []
+        self.accepted = []               # committed this session (persist in view)
+        self.on_pad_pick = None          # callback(net_name) on a pad click
+        self._down = None                # (x,y) at mouse-down, to tell click vs drag
+        self.debug_bmp = None            # A* explored heatmap (built by set_explored)
+        self.debug_extent = None         # (x0,y0,x1,y1) world mm of the heatmap
         self._geom_cache = {}
         self.zoom = 1.0
         self.panx = self.pany = 0.0
@@ -113,6 +121,24 @@ class PreviewPanel(wx.Panel):
         self.Refresh()
         self.Update()   # force an immediate repaint (Refresh alone from a
                         # CallAfter after the route thread didn't always paint)
+
+    def add_accepted(self, results):
+        """Fold just-accepted routes into the view as committed copper so they
+        stay visible on the next pass (the base render is from the saved file,
+        which doesn't have them yet)."""
+        self.accepted.extend(results or [])
+        self.Refresh()
+
+    def clear_accepted(self):
+        self.accepted = []
+        self.Refresh()
+
+    def set_explored(self, extent, bmp):
+        """extent=(x0,y0,x1,y1) world mm; bmp=wx.Bitmap heatmap (or None)."""
+        self.debug_extent = extent
+        self.debug_bmp = bmp
+        self.Refresh()
+        self.Update()
 
     def _ratsnest_for(self, name, geom):
         if self.status_loaded:
@@ -195,12 +221,33 @@ class PreviewPanel(wx.Panel):
 
     def on_down(self, evt):
         self._drag = (evt.GetX(), evt.GetY(), self.panx, self.pany)
+        self._down = (evt.GetX(), evt.GetY())
         self.CaptureMouse()
 
-    def on_up(self, _evt):
+    def on_up(self, evt):
         if self.HasCapture():
             self.ReleaseMouse()
         self._drag = None
+        # a click (no meaningful drag) selects the net under the cursor
+        if self._down is not None:
+            dx = evt.GetX() - self._down[0]
+            dy = evt.GetY() - self._down[1]
+            if dx * dx + dy * dy <= 16:      # <=4px movement == a click
+                self._pick_net_at(evt.GetX(), evt.GetY())
+        self._down = None
+
+    def _pick_net_at(self, mx, my):
+        if self.bg_bmp is None or self.origin is None or not self.on_pad_pick:
+            return
+        ppm = self._ppm()
+        bx0, by0 = self._origin_screen(ppm)
+        orx, ory = self.origin
+        wx_mm = orx + (mx - bx0) / ppm
+        wy_mm = ory + (my - by0) / ppm
+        name = shim.net_at_point(self.board, wx_mm, wy_mm,
+                                 tol_mm=3.0 / max(ppm, 0.01))
+        if name:
+            self.on_pad_pick(name)
 
     def on_motion(self, evt):
         if self._drag and evt.Dragging() and (evt.LeftIsDown() or
@@ -296,10 +343,18 @@ class PreviewPanel(wx.Panel):
 
         # dim the board when anything is highlighted so the overlays pop — but
         # subtly, so the rest of the traces stay faintly visible for context
-        if self.selected or self.proposed:
+        if self.selected or self.proposed or self.accepted:
             gc.SetPen(wx.Pen(wx.Colour(0, 0, 0, 0), 0))
             gc.SetBrush(wx.Brush(wx.Colour(0, 0, 0, 60)))
             gc.DrawRectangle(bx0, by0, self.vbw * ppm, self.vbh * ppm)
+
+        # debug: A* explored-cell heatmap (one scaled blit) — shows WHERE the
+        # search spent its time, right under the routes it produced
+        if self.debug_bmp is not None and self.debug_extent is not None:
+            ex0, ey0, ex1, ey1 = self.debug_extent
+            dsx, dsy = S(ex0, ey0)
+            gc.DrawBitmap(self.debug_bmp, dsx, dsy,
+                          (ex1 - ex0) * ppm, (ey1 - ey0) * ppm)
 
         for name in self.selected:
             g = self._geom_cache.get(name)
@@ -319,6 +374,20 @@ class PreviewPanel(wx.Panel):
             for (x, y, r) in g["pads"]:
                 cx, cy = S(x, y)
                 rr = max(r * ppm, 5)
+                gc.DrawEllipse(cx - rr, cy - rr, 2 * rr, 2 * rr)
+
+        # accepted copper: solid layer-colored lines (committed, no glow)
+        for res in self.accepted:
+            for (x1, y1, x2, y2, w, lyr) in res.get("segments", []):
+                col = _C_PROP.get(lyr, _C_PROP_DEFAULT)
+                gc.SetPen(wx.Pen(col, max(2, int(round(w * ppm)))))
+                a, b = S(x1, y1), S(x2, y2)
+                gc.StrokeLine(a[0], a[1], b[0], b[1])
+            gc.SetBrush(wx.Brush(_C_PROP_VIA))
+            gc.SetPen(wx.Pen(wx.Colour(255, 255, 255), 1.0))
+            for (x, y, dia, drill) in res.get("vias", []):
+                cx, cy = S(x, y)
+                rr = max(dia / 2.0 * ppm, 3)
                 gc.DrawEllipse(cx - rr, cy - rr, 2 * rr, 2 * rr)
 
         for res in self.proposed:
@@ -407,6 +476,9 @@ class RouterDialog(wx.Dialog):
         grid.Add(self.via_cost, 0, wx.EXPAND)
         left.Add(grid, 0, wx.EXPAND | wx.ALL, 8)
 
+        self.chk_debug = wx.CheckBox(panel, label="Debug: show A* search heatmap")
+        left.Add(self.chk_debug, 0, wx.LEFT | wx.BOTTOM, 8)
+
         self.btn_route = wx.Button(panel, label="Route")
         self.btn_route.SetDefault()
         left.Add(self.btn_route, 0, wx.EXPAND | wx.ALL, 8)
@@ -430,6 +502,7 @@ class RouterDialog(wx.Dialog):
         left.Add(self.btn_claude, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 8)
 
         self.preview = PreviewPanel(panel, board)
+        self.preview.on_pad_pick = self._on_pad_pick
         main.Add(left, 0, wx.EXPAND)
         main.SetItemMinSize(left, 360, -1)
         main.Add(self.preview, 1, wx.EXPAND | wx.ALL, 6)
@@ -464,7 +537,23 @@ class RouterDialog(wx.Dialog):
     def _show_actions(self, show):
         self.act_row.ShowItems(show)
         self.btn_route.Show(not show)
+        if show:
+            self.btn_commit.SetDefault()      # Accept is the primary action now
+        else:
+            self.btn_route.SetDefault()
         self.panel.Layout()
+
+    def _on_pad_pick(self, name):
+        """A pad was clicked in the preview: check + select that net."""
+        for i, n in enumerate(self.nets):
+            if n["name"] == name:
+                self.net_list.CheckItem(i, True)
+                self.net_list.Select(i)
+                self.net_list.Focus(i)
+                self.net_list.EnsureVisible(i)
+                self._update_route_enabled()
+                self._refresh_highlight()
+                return
 
     def _update_route_enabled(self):
         self.btn_route.Enable(self._loaded and bool(self._checked_names()))
@@ -569,6 +658,7 @@ class RouterDialog(wx.Dialog):
             return
         self._shown = []
         self.preview.set_proposed([])
+        self.preview.set_explored(None, None)   # clear any prior heatmap
         self.status.SetLabel("Routing…")
         self.gauge.SetRange(max(1, len(names)))
         self.gauge.SetValue(0)
@@ -581,21 +671,55 @@ class RouterDialog(wx.Dialog):
 
         params = self._params(jitter=jitter)
         cached = self.unconn
+        debug = self.chk_debug.GetValue()
 
         def on_net(done, total, result):
             wx.CallAfter(self._route_net_ui, done, total, result)
 
+        dbg = {"cells": set(), "grid": None}
+
+        def on_prog(cm, new_cells):
+            if dbg["grid"] is None:
+                dbg["grid"] = (cm.nx, cm.ny, cm.x0, cm.y0, cm.pitch)
+            for (i, j, _cl) in new_cells:
+                dbg["cells"].add((i, j))
+
         def worker():
             try:
                 unconn = cached or shim.drc_unconnected(bp)
-                results = router.route_batch(self.board, names, unconn, params,
-                                             on_net=on_net)
-                wx.CallAfter(self._route_done, results)
+                results = router.route_batch(
+                    self.board, names, unconn, params, on_net=on_net,
+                    on_progress=(on_prog if debug else None))
+                wx.CallAfter(self._route_done, results,
+                             dbg if debug else None)
             except Exception as e:  # noqa: BLE001
                 wx.CallAfter(self._route_error,
                              "%s\n\n%s" % (e, traceback.format_exc()))
 
         threading.Thread(target=worker, daemon=True).start()
+
+    def _build_debug_bitmap(self, dbg):
+        """Turn the set of explored A* cells into one scaled heatmap bitmap."""
+        grid = dbg.get("grid")
+        cells = dbg.get("cells")
+        if not grid or not cells:
+            return None, None
+        nx, ny, x0, y0, pitch = grid
+        rgb = bytearray(nx * ny * 3)
+        alpha = bytearray(nx * ny)
+        r, g, b = _C_DEBUG.Red(), _C_DEBUG.Green(), _C_DEBUG.Blue()
+        for (i, j) in cells:
+            if 0 <= i < nx and 0 <= j < ny:
+                idx = j * nx + i
+                rgb[idx * 3] = r
+                rgb[idx * 3 + 1] = g
+                rgb[idx * 3 + 2] = b
+                alpha[idx] = 90
+        img = wx.Image(nx, ny)
+        img.SetData(bytes(rgb))
+        img.SetAlpha(bytes(alpha))
+        extent = (x0, y0, x0 + nx * pitch, y0 + ny * pitch)
+        return extent, img.ConvertToBitmap()
 
     def _route_net_ui(self, done, total, result):
         self._shown.append(result)
@@ -615,10 +739,13 @@ class RouterDialog(wx.Dialog):
         self.status.SetLabel("Routing error — see details")
         self._text_dialog("Routing error", text)
 
-    def _route_done(self, results):
+    def _route_done(self, results, dbg=None):
         self._finish_route()
         self.proposed = results
         self.preview.set_proposed(results)
+        if dbg is not None:
+            extent, bmp = self._build_debug_bitmap(dbg)
+            self.preview.set_explored(extent, bmp)
         seg = sum(len(r.get("segments", [])) for r in results)
         via = sum(len(r.get("vias", [])) for r in results)
         if seg == 0 and via == 0:
@@ -656,9 +783,11 @@ class RouterDialog(wx.Dialog):
     def on_commit(self, _evt):
         added = 0
         done = []
+        committed = []
         for r in self.proposed:
             if r.get("segments") or r.get("vias"):
                 added += len(router.write_result(self.board, r["net_code"], r))
+                committed.append(r)
             done.append(r["net"])
         router.refill_zones(self.board)
         self._refresh_canvas()
@@ -667,6 +796,7 @@ class RouterDialog(wx.Dialog):
             self.unconn[name] = []
         self._apply_status()
         self.proposed = []
+        self.preview.add_accepted(committed)   # keep them visible next pass (h)
         self.preview.set_proposed([])
         self.preview.set_routing(self.unconn)
         self.status.SetLabel("Accepted %d items (Cmd+S to save). Route again."
