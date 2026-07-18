@@ -44,7 +44,8 @@ class RouterDialog(wx.Dialog):
         self.unconn = {}
         self._added = []            # uncommitted preview items in the board
         self._proposed_nets = []
-        self._brightened = []       # items highlighted for the selected net
+        self._brightened = []       # copper items brightened for selected net
+        self._rat_shapes = []       # bright ratsnest overlay shapes
         self._name2code = {n["name"]: n["code"] for n in self.nets}
         self._try_seed = 0
 
@@ -204,13 +205,51 @@ class RouterDialog(wx.Dialog):
                 it.ClearBrightened()
             except Exception:
                 pass
+        for s in self._rat_shapes:
+            try:
+                self.board.Remove(s)
+            except Exception:
+                pass
         self._brightened = []
+        self._rat_shapes = []
+
+    def _draw_ratsnest(self, name):
+        """Draw the selected net's remaining connections as BRIGHT lines on
+        Dwgs.User, so they stand out far more than KiCad's default airwires."""
+        gaps = self.unconn.get(name, [])
+        if not gaps:
+            return
+        layer = self.board.GetLayerID("Dwgs.User")
+        seg = getattr(pcbnew, "SHAPE_T_SEGMENT", None)
+        try:
+            col = pcbnew.COLOR4D(1.0, 0.24, 0.80, 1.0)   # bright magenta
+        except Exception:
+            col = None
+        w = int(0.15 * 1e6)
+        for (x1, y1, x2, y2) in gaps:
+            s = pcbnew.PCB_SHAPE(self.board)
+            if seg is not None:
+                s.SetShape(seg)
+            s.SetStart(pcbnew.VECTOR2I(int(x1 * 1e6), int(y1 * 1e6)))
+            s.SetEnd(pcbnew.VECTOR2I(int(x2 * 1e6), int(y2 * 1e6)))
+            s.SetWidth(w)
+            s.SetLayer(layer)
+            if col is not None:
+                try:
+                    s.SetLineColor(col)
+                except Exception:
+                    pass
+            s.SetBrightened()
+            self.board.Add(s)
+            self._rat_shapes.append(s)
 
     def on_select(self, evt):
-        """Highlight the clicked net's copper in KiCad's canvas (brighten)."""
+        """Highlight the clicked net in KiCad: brighten its copper AND draw its
+        remaining ratsnest bright."""
         idx = evt.GetIndex()
         self._clear_highlight()
-        code = self._name2code.get(self.nets[idx]["name"])
+        name = self.nets[idx]["name"]
+        code = self._name2code.get(name)
         if code is not None:
             for pad in self.board.GetPads():
                 if pad.GetNetCode() == code:
@@ -220,6 +259,7 @@ class RouterDialog(wx.Dialog):
                 if t.GetNetCode() == code:
                     t.SetBrightened()
                     self._brightened.append(t)
+        self._draw_ratsnest(name)
         try:
             pcbnew.Refresh()
         except Exception:
@@ -237,7 +277,8 @@ class RouterDialog(wx.Dialog):
             wx.MessageBox("Save the board first.", "dg-router")
             return
 
-        self._remove_added()   # replace any previous uncommitted preview
+        self._remove_added()     # replace any previous uncommitted preview
+        self._clear_highlight()  # stale ratsnest for routed nets would mislead
         self.status.SetLabel("Routing…")
         wx.BeginBusyCursor()
         try:
