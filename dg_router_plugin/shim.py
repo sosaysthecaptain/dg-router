@@ -216,6 +216,74 @@ def mst_edges(points):
     return edges
 
 
+_NET_IN_DESC = re.compile(r"\[([^\]]*)\]")
+
+
+def drc_unconnected(board_path):
+    """Ground-truth ratsnest via kicad-cli DRC.
+
+    Returns {net_name: [(x1,y1,x2,y2), ...]} — the MISSING connections (mm,
+    board coords) for each net. This is the oracle: it reflects what is *not*
+    yet routed, so partial nets show only the gaps left to complete.
+    """
+    cli = find_kicad_cli()
+    if not cli:
+        raise RuntimeError("kicad-cli not found")
+    import tempfile
+    out = os.path.join(tempfile.gettempdir(), "dg-router-drc.json")
+    # Nonzero exit just means violations exist; we parse the report regardless.
+    subprocess.run([cli, "pcb", "drc", "--format", "json", "-o", out, board_path],
+                   capture_output=True, text=True)
+    if not os.path.exists(out):
+        return {}
+    with open(out) as f:
+        data = json.load(f)
+
+    res = {}
+    for item in data.get("unconnected_items", []):
+        pts = item.get("items", [])
+        if len(pts) < 2:
+            continue
+        m = _NET_IN_DESC.search(pts[0].get("description", ""))
+        if not m:
+            continue
+        name = m.group(1)
+        a, b = pts[0]["pos"], pts[1]["pos"]
+        res.setdefault(name, []).append((a["x"], a["y"], b["x"], b["y"]))
+    return res
+
+
+def net_status_map(board, board_path):
+    """Per-net routing status + the missing-connection ratsnest.
+
+    Returns (status, unconnected):
+      status: {net_name: 'routed'|'partial'|'unrouted'} for nets with >=2 pads
+      unconnected: the drc_unconnected() map
+    """
+    unconn = drc_unconnected(board_path)
+    nets = list_nets(board)
+    code_name = {n["code"]: n["name"] for n in nets}
+
+    has_copper = {}
+    for t in board.GetTracks():
+        nm = code_name.get(t.GetNetCode())
+        if nm:
+            has_copper[nm] = True
+
+    status = {}
+    for n in nets:
+        name = n["name"]
+        if n["pads"] < 2:
+            continue
+        if len(unconn.get(name, [])) == 0:
+            status[name] = "routed"
+        elif has_copper.get(name):
+            status[name] = "partial"
+        else:
+            status[name] = "unrouted"
+    return status, unconn
+
+
 def build_job(route_nets, prefer, avoid=None, follow_existing=True,
               expendable=None, then=None):
     """Build a job-spec dict (the interchange the TS router core will consume)."""

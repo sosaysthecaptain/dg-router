@@ -30,6 +30,8 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description="dg-router shim (headless)")
     ap.add_argument("board", help="path to .kicad_pcb")
     ap.add_argument("--list", action="store_true", help="list nets and layers")
+    ap.add_argument("--status", action="store_true",
+                    help="per-net routing status via DRC (routed/partial/unrouted)")
     ap.add_argument("--render", action="store_true", help="render board to SVG")
     ap.add_argument("--route", nargs="*", default=[], help="net names to route")
     ap.add_argument("--layer", default="B.Cu", help="prefer layer")
@@ -43,12 +45,22 @@ def main(argv=None):
     out_dir = args.out or os.path.join(os.path.dirname(os.path.abspath(args.board)),
                                        "dg-router-out")
 
-    if args.list or not (args.render or args.emit):
+    if args.list or not (args.status or args.render or args.emit):
         nets = shim.list_nets(board)
         print("copper layers:", ", ".join(shim.copper_layer_names(board)))
         print("nets: %d" % len(nets))
         for n in nets:
             print("  [%3d] %-28s %d pads" % (n["code"], n["name"], n["pads"]))
+
+    if args.status:
+        status, unconn = shim.net_status_map(board, args.board)
+        counts = {"routed": 0, "partial": 0, "unrouted": 0}
+        for name in sorted(status):
+            counts[status[name]] += 1
+            print("  %-9s %-28s %d gap(s)"
+                  % (status[name], name, len(unconn.get(name, []))))
+        print("routed=%d partial=%d unrouted=%d"
+              % (counts["routed"], counts["partial"], counts["unrouted"]))
 
     if args.render:
         out = os.path.join(out_dir, "preview.svg")

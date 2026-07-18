@@ -17,13 +17,15 @@ import wx.svg
 from . import shim
 
 # highlight colors
-_C_PAD = wx.Colour(255, 235, 59)     # bright yellow
-_C_TRACK = wx.Colour(255, 140, 0)    # orange (existing copper)
-_C_VIA = wx.Colour(0, 229, 255)      # cyan
-_C_RATS = wx.Colour(120, 220, 255)   # light blue (ratsnest)
+_C_PAD = wx.Colour(255, 235, 59)     # bright yellow — net membership
+_C_KEPT = wx.Colour(75, 222, 128)    # green — existing copper (already routed, keep)
+_C_TODO = wx.Colour(255, 62, 165)    # magenta — remaining connections (still to route)
 _BG = wx.Colour(24, 24, 24)
 
 _BG_PPM = 10.0  # background raster resolution (px per mm)
+
+# net-list status badges
+_BADGE = {"routed": "✓ ", "partial": "◐ ", "unrouted": "· "}
 
 
 class PreviewPanel(wx.Panel):
@@ -38,6 +40,8 @@ class PreviewPanel(wx.Panel):
         self.err = None
         self.selected = []          # net names to highlight
         self._geom_cache = {}
+        self.unconn = {}            # net -> [(x1,y1,x2,y2)] remaining connections
+        self.status_loaded = False  # True once DRC routing status is in
         self.SetBackgroundStyle(wx.BG_STYLE_PAINT)
         self.Bind(wx.EVT_PAINT, self.on_paint)
         self.Bind(wx.EVT_SIZE, lambda e: (self.Refresh(), e.Skip()))
@@ -51,6 +55,22 @@ class PreviewPanel(wx.Panel):
                 self._geom_cache[name] = \
                     shim.net_geometry(self.board, [name]).get(name)
         self.Refresh()
+
+    def set_routing(self, unconn):
+        """Provide the DRC missing-connection map; switches the ratsnest from
+        the MST fallback to the ground-truth gaps."""
+        self.unconn = unconn or {}
+        self.status_loaded = True
+        self.Refresh()
+
+    def _ratsnest_for(self, name, geom):
+        """Remaining connections to draw. After DRC: the true gaps ([] if
+        routed). Before DRC: an MST over all pads (best-effort)."""
+        if self.status_loaded:
+            return self.unconn.get(name, [])
+        pts = [(p[0], p[1]) for p in geom["pads"]]
+        return [(pts[i][0], pts[i][1], pts[j][0], pts[j][1])
+                for i, j in shim.mst_edges(pts)]
 
     def _ensure_background(self):
         if self.bg_bmp is not None or self.err is not None:
@@ -111,31 +131,26 @@ class PreviewPanel(wx.Panel):
             if not g:
                 continue
 
-            # ratsnest (approx MST over pad centers) — draw first, underneath
-            pts = [(p[0], p[1]) for p in g["pads"]]
-            if len(pts) >= 2:
-                pen = wx.Pen(_C_RATS, 1, wx.PENSTYLE_SHORT_DASH)
-                gc.SetPen(pen)
-                for i, j in shim.mst_edges(pts):
-                    a, b = T(*pts[i]), T(*pts[j])
-                    gc.StrokeLine(a[0], a[1], b[0], b[1])
-
-            # existing tracks on the net
-            gc.SetPen(wx.Pen(_C_TRACK, max(1.5, 0)))
-            for (x1, y1, x2, y2, w) in g["tracks"]:
-                gc.SetPen(wx.Pen(_C_TRACK, max(1.0, w * eff)))
+            # remaining connections (magenta dashed) — what's still to route.
+            # Drawn first, underneath the kept copper.
+            gc.SetPen(wx.Pen(_C_TODO, 1, wx.PENSTYLE_SHORT_DASH))
+            for (x1, y1, x2, y2) in self._ratsnest_for(name, g):
                 a, b = T(x1, y1), T(x2, y2)
                 gc.StrokeLine(a[0], a[1], b[0], b[1])
 
-            # vias
-            gc.SetBrush(wx.Brush(_C_VIA))
-            gc.SetPen(wx.Pen(_C_VIA, 1))
+            # existing copper (green) — already routed, kept as-is
+            for (x1, y1, x2, y2, w) in g["tracks"]:
+                gc.SetPen(wx.Pen(_C_KEPT, int(max(1, round(w * eff)))))
+                a, b = T(x1, y1), T(x2, y2)
+                gc.StrokeLine(a[0], a[1], b[0], b[1])
+            gc.SetBrush(wx.Brush(_C_KEPT))
+            gc.SetPen(wx.Pen(_C_KEPT, 1))
             for (x, y, r) in g["vias"]:
                 cx, cy = T(x, y)
                 rr = max(r * eff, 2.5)
                 gc.DrawEllipse(cx - rr, cy - rr, 2 * rr, 2 * rr)
 
-            # pads (bright, semi-transparent so the pad underneath still reads)
+            # pads (bright yellow, semi-transparent so the pad underneath reads)
             gc.SetBrush(wx.Brush(wx.Colour(255, 235, 59, 150)))
             gc.SetPen(wx.Pen(_C_PAD, 1.5))
             for (x, y, r) in g["pads"]:
@@ -161,7 +176,8 @@ class RouterDialog(wx.Dialog):
         left.Add(wx.StaticText(panel, label="Nets (%d) — click to preview, "
                                "check to route:" % len(self.nets)),
                  0, wx.LEFT | wx.TOP, 8)
-        labels = ["%s  (%d pads)" % (n["name"], n["pads"]) for n in self.nets]
+        self.status_map = {}
+        labels = [self._net_label(n) for n in self.nets]
         self.net_list = wx.CheckListBox(panel, choices=labels)
         left.Add(self.net_list, 1, wx.EXPAND | wx.ALL, 8)
 
@@ -210,6 +226,36 @@ class RouterDialog(wx.Dialog):
         self.net_list.Bind(wx.EVT_CHECKLISTBOX, self.on_selection)
         self.btn_open.Bind(wx.EVT_BUTTON, self.on_open)
         self.btn_emit.Bind(wx.EVT_BUTTON, self.on_emit)
+
+        # DRC routing-status is slow-ish; load it after the dialog is visible.
+        if self.board.GetFileName():
+            self.status.SetLabel("Computing routing status (DRC)…")
+            wx.CallAfter(self._load_status)
+
+    # --- routing status ---------------------------------------------------
+
+    def _net_label(self, net):
+        badge = _BADGE.get(self.status_map.get(net["name"]), "")
+        return "%s%s  (%d pads)" % (badge, net["name"], net["pads"])
+
+    def _load_status(self):
+        try:
+            status, unconn = shim.net_status_map(self.board,
+                                                 self.board.GetFileName())
+        except Exception as e:  # noqa: BLE001
+            self.status.SetLabel("Routing status unavailable: %s" % e)
+            return
+        self.status_map = status
+        for i, n in enumerate(self.nets):
+            self.net_list.SetString(i, self._net_label(n))
+        self.preview.set_routing(unconn)
+        counts = {"routed": 0, "partial": 0, "unrouted": 0}
+        for v in status.values():
+            counts[v] += 1
+        self.status.SetLabel(
+            "✓ %d routed   ◐ %d partial   · %d unrouted   "
+            "(green=keep, magenta=to route)"
+            % (counts["routed"], counts["partial"], counts["unrouted"]))
 
     # --- selection / preview ----------------------------------------------
 
