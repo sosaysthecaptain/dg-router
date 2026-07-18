@@ -298,10 +298,11 @@ class PreviewPanel(wx.Panel):
             gc.SetPen(wx.Pen(col, w, style))
             gc.StrokeLine(a[0], a[1], b[0], b[1])
 
-        # dim the board when anything is highlighted so the overlays pop
+        # dim the board when anything is highlighted so the overlays pop — but
+        # subtly, so the rest of the traces stay faintly visible for context
         if self.selected or self.proposed:
             gc.SetPen(wx.Pen(wx.Colour(0, 0, 0, 0), 0))
-            gc.SetBrush(wx.Brush(wx.Colour(0, 0, 0, 120)))
+            gc.SetBrush(wx.Brush(wx.Colour(0, 0, 0, 60)))
             gc.DrawRectangle(bx0, by0, self.vbw * ppm, self.vbh * ppm)
 
         for name in self.selected:
@@ -397,7 +398,7 @@ class RouterDialog(wx.Dialog):
         self.objective = wx.RadioBox(
             panel, label="Objective",
             choices=["Least obtrusive", "Direct", "Follow existing", "Hug edges"],
-            majorDimension=2, style=wx.RA_SPECIFY_COLS)
+            majorDimension=1, style=wx.RA_SPECIFY_COLS)   # vertical stack
         self.objective.SetSelection(0)   # least obtrusive default
         left.Add(self.objective, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 8)
 
@@ -429,7 +430,7 @@ class RouterDialog(wx.Dialog):
         self.status = wx.StaticText(panel, label="Loading…")
         left.Add(self.status, 0, wx.ALL, 8)
 
-        self.btn_claude = wx.Button(panel, label="Driving from Claude…")
+        self.btn_claude = wx.Button(panel, label="Agent instructions (markdown)")
         left.Add(self.btn_claude, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 8)
 
         self.preview = PreviewPanel(panel, board)
@@ -560,7 +561,7 @@ class RouterDialog(wx.Dialog):
         except Exception:
             pass
 
-    # --- routing (preview-first: proposed shown in the panel, not the board) ---
+    # --- routing (preview-first, ON A THREAD so status/progress stay live) ---
     def _compute(self, jitter):
         names = self._checked_names()
         if not names:
@@ -570,45 +571,69 @@ class RouterDialog(wx.Dialog):
         if not bp or not os.path.exists(bp):
             wx.MessageBox("Save the board first.", "dg-router")
             return
+        self._shown = []
+        self.preview.set_proposed([])
         self.status.SetLabel("Routing…")
-        self.gauge.SetRange(len(names))
+        self.gauge.SetRange(max(1, len(names)))
         self.gauge.SetValue(0)
         self.gauge.Show()
         self.panel.Layout()
-        shown = []
+        # lock interaction while the worker reads the board (avoid concurrent
+        # pcbnew access + double-route)
+        self.btn_route.Disable()
+        self.net_list.Disable()
+
+        params = self._params(jitter=jitter)
+        cached = self.unconn
 
         def on_net(done, total, result):
-            # reveal each net's route as it's computed + advance the bar. Update()
-            # repaints synchronously (no event-loop reentry -> safe).
-            shown.append(result)
-            self.preview.set_proposed(list(shown))
-            self.gauge.SetValue(done)
-            self.status.SetLabel("Routing %d/%d — %s" % (done, total, result["net"]))
-            self.preview.Update()
-            self.gauge.Update()
-            self.status.Update()
+            wx.CallAfter(self._route_net_ui, done, total, result)
 
-        try:
-            unconn = self.unconn or shim.drc_unconnected(bp)
-            results = router.route_batch(self.board, names, unconn,
-                                         self._params(jitter=jitter), on_net=on_net)
-        except Exception as e:  # noqa: BLE001
-            self.gauge.Hide()
-            self.panel.Layout()
-            wx.MessageBox("Routing error:\n%s\n\n%s" % (e, traceback.format_exc()),
-                          "dg-router")
-            return
+        def worker():
+            try:
+                unconn = cached or shim.drc_unconnected(bp)
+                results = router.route_batch(self.board, names, unconn, params,
+                                             on_net=on_net)
+                wx.CallAfter(self._route_done, results)
+            except Exception as e:  # noqa: BLE001
+                wx.CallAfter(self._route_error,
+                             "%s\n\n%s" % (e, traceback.format_exc()))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _route_net_ui(self, done, total, result):
+        self._shown.append(result)
+        self.preview.set_proposed(list(self._shown))
+        self.gauge.SetRange(max(1, total))
+        self.gauge.SetValue(done)
+        self.status.SetLabel("Routing %d/%d — %s" % (done, total, result["net"]))
+
+    def _finish_route(self):
         self.gauge.Hide()
         self.panel.Layout()
+        self.net_list.Enable()
 
+    def _route_error(self, text):
+        self._finish_route()
+        self.btn_route.Enable()
+        self.status.SetLabel("Routing error — see details")
+        self._text_dialog("Routing error", text)
+
+    def _route_done(self, results):
+        self._finish_route()
         self.proposed = results
-        self.preview.set_proposed(results)   # shown in preview only
+        self.preview.set_proposed(results)
         seg = sum(len(r.get("segments", [])) for r in results)
         via = sum(len(r.get("vias", [])) for r in results)
         if seg == 0 and via == 0:
-            why = "; ".join("%s: %s" % (r["net"], r.get("reason") or "no path")
+            self.btn_route.Enable()
+            why = "\n".join("  %s: %s" % (r["net"], r.get("reason") or "no path")
                             for r in results if not r.get("ok"))
-            self.status.SetLabel("Couldn't route — " + why[:80])
+            self.status.SetLabel("Couldn't route — see details")
+            self._text_dialog("Couldn't route",
+                              "No tracks were produced for:\n\n" + why +
+                              "\n\nTry: more layers, higher via cost, a different "
+                              "objective, or route fewer/other nets first.")
             self._show_actions(False)
             return
         bad = sum(1 for r in results if not r.get("ok"))
@@ -660,17 +685,10 @@ class RouterDialog(wx.Dialog):
         self._show_actions(False)
         self._update_route_enabled()
 
-    def on_driving(self, _evt):
-        path = os.path.join(os.path.dirname(os.path.dirname(
-            os.path.realpath(__file__))), "docs", "DRIVING.md")
-        try:
-            with open(path) as f:
-                text = f.read()
-        except Exception:
-            text = ("See docs/DRIVING.md in the dg-router repo — the headless "
-                    "CLI (headless.py) is the API for driving from Claude.")
-        d = wx.Dialog(self, title="Driving dg-router from Claude",
-                      size=(720, 640), style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER)
+    def _text_dialog(self, title, text, size=(720, 640)):
+        """A read-only, COPYABLE text window (errors, agent instructions)."""
+        d = wx.Dialog(self, title=title, size=size,
+                      style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER)
         tc = wx.TextCtrl(d, value=text,
                          style=wx.TE_MULTILINE | wx.TE_READONLY | wx.TE_DONTWRAP)
         tc.SetFont(wx.Font(wx.FontInfo(11).Family(wx.FONTFAMILY_TELETYPE)))
@@ -680,6 +698,17 @@ class RouterDialog(wx.Dialog):
         d.ShowModal()
         d.Destroy()
 
+    def on_driving(self, _evt):
+        path = os.path.join(os.path.dirname(os.path.dirname(
+            os.path.realpath(__file__))), "docs", "DRIVING.md")
+        try:
+            with open(path) as f:
+                text = f.read()
+        except Exception:
+            text = ("See docs/DRIVING.md in the dg-router repo — the headless "
+                    "CLI (headless.py) is the API for driving from an agent.")
+        self._text_dialog("Agent instructions", text)
+
     def on_close(self, _evt):
         if self in _OPEN:
             _OPEN.remove(self)
@@ -687,6 +716,13 @@ class RouterDialog(wx.Dialog):
 
 
 def show_dialog(board):
+    for d in _OPEN:                 # one window only — raise the existing one
+        try:
+            d.Raise()
+            d.Iconize(False)
+            return
+        except Exception:
+            pass
     dlg = RouterDialog(board)
     _OPEN.append(dlg)
     dlg.Show()
