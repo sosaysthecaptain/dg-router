@@ -46,6 +46,9 @@ def main(argv=None):
                     help="A* cost (grid steps) per via")
     ap.add_argument("--layers", default="F.Cu,B.Cu",
                     help="comma-separated routable copper layers")
+    ap.add_argument("--objective", default="least_obtrusive",
+                    help="direct | follow | hug | least_obtrusive")
+    ap.add_argument("--prefer", default=None, help="prefer this layer")
     ap.add_argument("--out", default=None, help="output dir (default: next to board)")
     args = ap.parse_args(argv)
 
@@ -81,7 +84,8 @@ def main(argv=None):
         out = os.path.join(out_dir, "routed.kicad_pcb")
         params = router.RouteParams(
             board, pitch_mm=args.pitch, via_cost=args.route_via_cost,
-            layer_names=[s.strip() for s in args.layers.split(",") if s.strip()])
+            layer_names=[s.strip() for s in args.layers.split(",") if s.strip()],
+            objective=args.objective, prefer_layer=args.prefer)
         summary = router.solve(args.board, args.route, out, params=params)
         for r in summary["results"]:
             print("  %-22s ok=%s  %s" % (

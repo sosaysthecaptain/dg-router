@@ -385,6 +385,22 @@ class RouterDialog(wx.Dialog):
             lrow.Add(cb, 0, wx.RIGHT, 6)
         left.Add(lrow, 0, wx.LEFT | wx.BOTTOM, 8)
 
+        prow = wx.BoxSizer(wx.HORIZONTAL)
+        prow.Add(wx.StaticText(panel, label="Prefer:"),
+                 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 6)
+        self.prefer = wx.Choice(panel, choices=["(any)"] + self.layers)
+        self.prefer.SetSelection(0)
+        prow.Add(self.prefer, 0)
+        left.Add(prow, 0, wx.LEFT | wx.BOTTOM, 8)
+
+        self._obj_keys = ["least_obtrusive", "direct", "follow", "hug"]
+        self.objective = wx.RadioBox(
+            panel, label="Objective",
+            choices=["Least obtrusive", "Direct", "Follow existing", "Hug edges"],
+            majorDimension=2, style=wx.RA_SPECIFY_COLS)
+        self.objective.SetSelection(0)   # least obtrusive default
+        left.Add(self.objective, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 8)
+
         grid = wx.FlexGridSizer(cols=2, vgap=6, hgap=8)
         grid.AddGrowableCol(1, 1)
         grid.Add(wx.StaticText(panel, label="Via cost:"),
@@ -526,9 +542,12 @@ class RouterDialog(wx.Dialog):
         return chosen or ["F.Cu", "B.Cu"]
 
     def _params(self, jitter=0.0):
+        pf = self.prefer.GetStringSelection()
         return router.RouteParams(
             self.board, via_cost=float(self.via_cost.GetValue()),
-            layer_names=self.selected_layers(), seed=self._try_seed, jitter=jitter)
+            layer_names=self.selected_layers(), seed=self._try_seed, jitter=jitter,
+            objective=self._obj_keys[self.objective.GetSelection()],
+            prefer_layer=(None if pf == "(any)" else pf))
 
     def _refresh_canvas(self):
         try:

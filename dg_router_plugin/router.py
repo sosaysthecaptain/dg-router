@@ -62,11 +62,19 @@ def _via_width_mm(via, layer):
 
 class RouteParams:
     def __init__(self, board, pitch_mm=0.2, turn_cost=0.7, via_cost=10.0,
-                 layer_names=None, seed=0, jitter=0.0):
+                 layer_names=None, seed=0, jitter=0.0,
+                 objective="least_obtrusive", prefer_layer=None):
         ds = board.GetDesignSettings()
         self.pitch = pitch_mm
         self.turn_cost = turn_cost
         self.via_cost = via_cost           # extra A* cost (grid steps) per via
+        # routing objective (cost-term preset): direct | follow | hug |
+        # least_obtrusive. least_obtrusive hugs edges/copper and avoids grabbing
+        # open territory (keeps it from walling off chips).
+        self.objective = objective
+        self.prefer_layer = prefer_layer   # bias toward this layer if set
+        self.prefer_layer_id = (board.GetLayerID(prefer_layer)
+                                if prefer_layer else None)
         # "Try again" perturbs costs so a deterministic A* yields a different
         # valid solution. jitter=0 -> deterministic.
         self.jitter = jitter
@@ -112,6 +120,7 @@ class CostMap:
         self.blocked = [bytearray(n) for _ in self.layers]
         self.via_blocked = bytearray(n)
         self.attract = [bytearray(n) for _ in self.layers]  # bus bundling bonus
+        self.dist = [None for _ in self.layers]  # dist-to-nearest-obstacle (cells)
         # clearance + width/2 is the true minimum; add a full cell of
         # discretization safety so cell-center paths never violate clearance.
         self.track_inflate = clearance + width / 2.0 + pitch
@@ -226,6 +235,39 @@ class CostMap:
                 self._disc(self.blocked[li], x, y, dia / 2.0 + self.track_inflate)
             self._disc(self.via_blocked, x, y, dia / 2.0 + self.via_inflate)
 
+    def compute_dist(self, li, cap=60):
+        """Multi-source BFS: distance (in cells, capped) from each free cell to
+        the nearest obstacle. Drives the hug/least-obtrusive/follow objectives."""
+        if self.dist[li] is not None:
+            return
+        from collections import deque
+        nx, ny = self.nx, self.ny
+        blk = self.blocked[li]
+        d = bytearray(b'\xff' * (nx * ny))
+        dq = deque()
+        for idx in range(nx * ny):
+            if blk[idx]:
+                d[idx] = 0
+                dq.append(idx)
+        while dq:
+            idx = dq.popleft()
+            cd = d[idx]
+            if cd >= cap:
+                continue
+            i, j = idx % nx, idx // nx
+            for di, dj in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                ni, nj = i + di, j + dj
+                if 0 <= ni < nx and 0 <= nj < ny:
+                    nidx = nj * nx + ni
+                    if d[nidx] > cd + 1:
+                        d[nidx] = cd + 1
+                        dq.append(nidx)
+        self.dist[li] = d
+
+    def dist_at(self, li, i, j):
+        d = self.dist[li]
+        return 60 if d is None else min(60, d[j * self.nx + i])
+
     def add_attraction(self, li, cells, radius_cells=2, bonus=1):
         """Mark cells (and a neighborhood) on a layer as attractive, so later
         nets in the batch prefer to run alongside — bus bundling."""
@@ -316,6 +358,17 @@ def astar(cm, starts, goal_cell, goal_layers, params, max_expansions=1_500_000,
             cost = step + turn * params.turn_cost
             if cm.attract[cl][cm.idx(ni, nj)]:
                 cost = max(0.1, cost - attract_bonus)
+            obj = params.objective
+            if obj == "least_obtrusive":       # avoid open space; hug stuff
+                cost += 0.06 * cm.dist_at(cl, ni, nj)
+            elif obj == "hug":                 # prefer near the board edge
+                cost += 0.03 * min(ni, cm.nx - 1 - ni, nj, cm.ny - 1 - nj)
+            elif obj == "follow":              # run alongside existing copper
+                if cm.dist_at(cl, ni, nj) <= 3:
+                    cost = max(0.1, cost - 0.5)
+            if (params.prefer_layer_id is not None
+                    and cm.layers[cl] != params.prefer_layer_id):
+                cost += 0.35
             if params.jitter:
                 cost += params.jitter * params._rng.random()
             ng = gc + cost
@@ -515,6 +568,9 @@ def route_net(board, net_name, gaps, params, prior_segments=None,
     if attract_paths:
         for li, cells in attract_paths.items():
             cm.add_attraction(li, cells)
+    if params.objective in ("least_obtrusive", "follow"):
+        for li in range(len(routable)):
+            cm.compute_dist(li)
     lidx = {L: k for k, L in enumerate(routable)}
 
     segments, vias, path_cells_by_layer = [], [], {}
