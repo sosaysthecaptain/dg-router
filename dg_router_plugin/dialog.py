@@ -429,6 +429,9 @@ class RouterDialog(wx.Dialog):
         self.status = wx.StaticText(panel, label="Loading…")
         left.Add(self.status, 0, wx.ALL, 8)
 
+        self.btn_claude = wx.Button(panel, label="Driving from Claude…")
+        left.Add(self.btn_claude, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 8)
+
         self.preview = PreviewPanel(panel, board)
         main.Add(left, 0, wx.EXPAND)
         main.SetItemMinSize(left, 360, -1)
@@ -445,6 +448,7 @@ class RouterDialog(wx.Dialog):
         self.btn_revert.Bind(wx.EVT_BUTTON, self.on_revert)
         self.btn_all.Bind(wx.EVT_BUTTON, lambda e: self._check_all(True))
         self.btn_none.Bind(wx.EVT_BUTTON, lambda e: self._check_all(False))
+        self.btn_claude.Bind(wx.EVT_BUTTON, self.on_driving)
         self.net_list.Bind(wx.EVT_LIST_ITEM_SELECTED, self.on_select)
         self.net_list.Bind(wx.EVT_LIST_ITEM_CHECKED, self.on_check)
         self.net_list.Bind(wx.EVT_LIST_ITEM_UNCHECKED, self.on_check)
@@ -655,6 +659,26 @@ class RouterDialog(wx.Dialog):
         self._refresh_highlight()
         self._show_actions(False)
         self._update_route_enabled()
+
+    def on_driving(self, _evt):
+        path = os.path.join(os.path.dirname(os.path.dirname(
+            os.path.realpath(__file__))), "docs", "DRIVING.md")
+        try:
+            with open(path) as f:
+                text = f.read()
+        except Exception:
+            text = ("See docs/DRIVING.md in the dg-router repo — the headless "
+                    "CLI (headless.py) is the API for driving from Claude.")
+        d = wx.Dialog(self, title="Driving dg-router from Claude",
+                      size=(720, 640), style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER)
+        tc = wx.TextCtrl(d, value=text,
+                         style=wx.TE_MULTILINE | wx.TE_READONLY | wx.TE_DONTWRAP)
+        tc.SetFont(wx.Font(wx.FontInfo(11).Family(wx.FONTFAMILY_TELETYPE)))
+        s = wx.BoxSizer(wx.VERTICAL)
+        s.Add(tc, 1, wx.EXPAND | wx.ALL, 8)
+        d.SetSizer(s)
+        d.ShowModal()
+        d.Destroy()
 
     def on_close(self, _evt):
         if self in _OPEN:

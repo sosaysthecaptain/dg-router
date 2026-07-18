@@ -34,6 +34,8 @@ def main(argv=None):
     ap.add_argument("--status", action="store_true",
                     help="per-net routing status via DRC (routed/partial/unrouted)")
     ap.add_argument("--render", action="store_true", help="render board to SVG")
+    ap.add_argument("--render-png", dest="render_png", default=None,
+                    help="emit a 2D PNG render (readable by Claude)")
     ap.add_argument("--route", nargs="*", default=[], help="net names to route")
     ap.add_argument("--layer", default="B.Cu", help="prefer layer")
     ap.add_argument("--via-cost", type=int, default=80)
@@ -56,7 +58,8 @@ def main(argv=None):
     out_dir = args.out or os.path.join(os.path.dirname(os.path.abspath(args.board)),
                                        "dg-router-out")
 
-    if args.list or not (args.status or args.render or args.emit or args.solve):
+    if args.list or not (args.status or args.render or args.render_png
+                         or args.emit or args.solve):
         nets = shim.list_nets(board)
         print("copper layers:", ", ".join(shim.copper_layer_names(board)))
         print("nets: %d" % len(nets))
@@ -77,6 +80,9 @@ def main(argv=None):
         out = os.path.join(out_dir, "preview.svg")
         print("rendered:", shim.render_board_svg(args.board, out))
 
+    if args.render_png:
+        print("rendered:", shim.render_board_png(args.board, args.render_png))
+
     if args.solve:
         if not args.route:
             ap.error("--solve requires --route NET [NET ...]")
@@ -95,6 +101,12 @@ def main(argv=None):
         after = sum(len(v) for v in shim.drc_unconnected(out).values())
         print("tracks added: %d" % summary["tracks_added"])
         print("unconnected: %d -> %d  (wrote %s)" % (before, after, out))
+        png = os.path.join(out_dir, "routed.png")
+        try:
+            shim.render_board_png(out, png)
+            print("render: %s" % png)
+        except Exception as e:  # noqa: BLE001
+            print("render failed: %s" % e)
 
     if args.emit:
         job = shim.build_job(

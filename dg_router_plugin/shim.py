@@ -307,6 +307,25 @@ def net_status_map(board, board_path):
     return status, unconn
 
 
+def render_board_png(board_path, out_png, layers=None, ppm=12.0):
+    """Flat 2D PNG render (via SVG -> wx.svg raster) — something Claude can read.
+    No external raster dependency."""
+    import tempfile
+    svg = os.path.join(tempfile.gettempdir(), "dg-render.svg")
+    render_board_svg(board_path, svg, layers)
+    import wx
+    import wx.svg
+    if wx.App.Get() is None:
+        render_board_png._app = wx.App()   # keep a ref alive
+    vbw, vbh = parse_svg_viewbox(svg)
+    img = wx.svg.SVGimage.CreateFromFile(svg)
+    bmp = img.ConvertToScaledBitmap(
+        wx.Size(max(1, int(vbw * ppm)), max(1, int(vbh * ppm))))
+    os.makedirs(os.path.dirname(os.path.abspath(out_png)), exist_ok=True)
+    bmp.ConvertToImage().SaveFile(out_png, wx.BITMAP_TYPE_PNG)
+    return out_png
+
+
 def build_job(route_nets, prefer, avoid=None, follow_existing=True,
               expendable=None, then=None):
     """Build a job-spec dict (the interchange the TS router core will consume)."""
