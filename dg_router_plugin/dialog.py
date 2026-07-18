@@ -105,17 +105,23 @@ class RouterDialog(wx.Dialog):
         v.Add(self.status, 0, wx.ALL, 8)
 
         panel.SetSizer(v)
+        self.panel = panel
+        root = wx.BoxSizer(wx.VERTICAL)
+        root.Add(panel, 1, wx.EXPAND)
+        self.SetSizer(root)
 
         self.btn_route.Bind(wx.EVT_BUTTON, self.on_route)
         self.btn_try.Bind(wx.EVT_BUTTON, self.on_try_again)
         self.btn_commit.Bind(wx.EVT_BUTTON, self.on_commit)
         self.btn_revert.Bind(wx.EVT_BUTTON, self.on_revert)
         self.net_list.Bind(wx.EVT_LIST_ITEM_SELECTED, self.on_select)
+        self.net_list.Bind(wx.EVT_LIST_ITEM_CHECKED, self.on_check)
+        self.net_list.Bind(wx.EVT_LIST_ITEM_UNCHECKED, self.on_check)
         self.Bind(wx.EVT_CLOSE, self.on_close)
 
+        self._loaded = False
         self._show_actions(False)
-        # instant window: show a loading state, disable Route until status loads
-        self.btn_route.Disable()
+        self._update_route_enabled()
         if self.board.GetFileName():
             wx.CallAfter(self._load_status)
         else:
@@ -126,7 +132,13 @@ class RouterDialog(wx.Dialog):
     def _show_actions(self, show):
         self.act_row.ShowItems(show)
         self.btn_route.Show(not show)
-        self.Layout()
+        self.panel.Layout()   # the sizer lives on the panel, not the dialog
+
+    def _update_route_enabled(self):
+        self.btn_route.Enable(self._loaded and bool(self._checked_names()))
+
+    def on_check(self, _evt):
+        self._update_route_enabled()
 
     def _apply_status_colors(self):
         for i, n in enumerate(self.nets):
@@ -143,7 +155,8 @@ class RouterDialog(wx.Dialog):
         self.status_map = status
         self.unconn = unconn
         self._apply_status_colors()
-        self.btn_route.Enable()
+        self._loaded = True
+        self._update_route_enabled()
         c = {"routed": 0, "partial": 0, "unrouted": 0}
         for x in status.values():
             c[x] += 1
@@ -160,6 +173,7 @@ class RouterDialog(wx.Dialog):
         self._proposed_nets = []
         self._refresh_canvas()
         self._show_actions(False)
+        self._update_route_enabled()
 
     def _checked_names(self):
         return [self.nets[i]["name"] for i in range(self.net_list.GetItemCount())
@@ -293,10 +307,14 @@ class RouterDialog(wx.Dialog):
         wx.EndBusyCursor()
         self._refresh_canvas()
 
-        ok = sum(1 for r in results if r.get("ok"))
-        self.status.SetLabel(
-            "Proposed %d/%d nets (+%d items). Accept / Reject / Try again"
-            % (ok, len(results), len(self._added)))
+        seg = sum(len(r.get("segments", [])) for r in results)
+        via = sum(len(r.get("vias", [])) for r in results)
+        incomplete = sum(1 for r in results if not r.get("ok"))
+        msg = "Proposed %d tracks, %d vias" % (seg, via)
+        if incomplete:
+            msg += "  (%d net%s incomplete)" % (incomplete,
+                                                "" if incomplete == 1 else "s")
+        self.status.SetLabel(msg + " — Accept / Reject / Try again")
         self._show_actions(True)
 
     def on_route(self, _evt):
