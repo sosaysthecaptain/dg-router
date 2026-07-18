@@ -349,19 +349,50 @@ def split_layer_runs(cells3):
     return runs, vias
 
 
-def octilinear_polyline(cm, cells):
-    if len(cells) <= 1:
+def _octi_corner(a, b):
+    """Corner making a->b an octilinear L: 45deg diagonal then orthogonal."""
+    dx, dy = b[0] - a[0], b[1] - a[1]
+    diag = min(abs(dx), abs(dy))
+    return (a[0] + _sgn(dx) * diag, a[1] + _sgn(dy) * diag)
+
+
+def _seg_clear(cm, li, a, b):
+    """Is the octilinear segment a->b free on layer li (no corner-cutting)?"""
+    x, y = a
+    dx, dy = _sgn(b[0] - a[0]), _sgn(b[1] - a[1])
+    n = max(abs(b[0] - a[0]), abs(b[1] - a[1]))
+    for _ in range(n + 1):
+        if not cm.in_bounds(x, y) or cm.blocked_at(li, x, y):
+            return False
+        if dx and dy and cm.blocked_at(li, x + dx, y) and cm.blocked_at(li, x, y + dy):
+            return False
+        x += dx
+        y += dy
+    return True
+
+
+def octi_pull(cm, li, cells):
+    """Collapse an A* cell path into the fewest octilinear segments: greedily
+    connect the farthest reachable point with a 45deg+orthogonal L. Removes the
+    grid staircase."""
+    if len(cells) <= 2:
         return [cm.to_world(*c) for c in cells]
-    keep = [cells[0]]
-    prev = (_sgn(cells[1][0] - cells[0][0]), _sgn(cells[1][1] - cells[0][1]))
-    for k in range(1, len(cells) - 1):
-        d = (_sgn(cells[k + 1][0] - cells[k][0]),
-             _sgn(cells[k + 1][1] - cells[k][1]))
-        if d != prev:
-            keep.append(cells[k])
-            prev = d
-    keep.append(cells[-1])
-    return [cm.to_world(*c) for c in keep]
+    out = [cells[0]]
+    i = 0
+    while i < len(cells) - 1:
+        best = i + 1
+        for j in range(len(cells) - 1, i, -1):
+            corner = _octi_corner(cells[i], cells[j])
+            if _seg_clear(cm, li, cells[i], corner) and \
+               _seg_clear(cm, li, corner, cells[j]):
+                best = j
+                break
+        corner = _octi_corner(cells[i], cells[best])
+        if corner != cells[i] and corner != cells[best]:
+            out.append(corner)
+        out.append(cells[best])
+        i = best
+    return [cm.to_world(*c) for c in out]
 
 
 # --- pad entry + neck-down --------------------------------------------------
@@ -497,7 +528,7 @@ def route_net(board, net_name, gaps, params, prior_segments=None,
 
         for ri, (li, run) in enumerate(runs):
             path_cells_by_layer.setdefault(li, []).extend(run)
-            pts = octilinear_polyline(cm, run)
+            pts = octi_pull(cm, li, run)
             if ri == 0:  # attach the start pad
                 pts = _octi_stub((x1, y1), pts[0])[:-1] + pts
             if ri == len(runs) - 1:  # attach the end pad
