@@ -288,38 +288,51 @@ class PreviewPanel(wx.Panel):
         def S(x, y):
             return (bx0 + (x - orx) * ppm, by0 + (y - ory) * ppm)
 
+        def glow_line(a, b, col, w, dashed):
+            # bright halo under a solid/dashed core so the line is unmissable
+            w = max(1, int(round(w)))
+            gc.SetPen(wx.Pen(wx.Colour(col.Red(), col.Green(), col.Blue(), 80),
+                             w * 3))
+            gc.StrokeLine(a[0], a[1], b[0], b[1])
+            style = wx.PENSTYLE_SHORT_DASH if dashed else wx.PENSTYLE_SOLID
+            gc.SetPen(wx.Pen(col, w, style))
+            gc.StrokeLine(a[0], a[1], b[0], b[1])
+
+        # dim the board when anything is highlighted so the overlays pop
+        if self.selected or self.proposed:
+            gc.SetPen(wx.Pen(wx.Colour(0, 0, 0, 0), 0))
+            gc.SetBrush(wx.Brush(wx.Colour(0, 0, 0, 120)))
+            gc.DrawRectangle(bx0, by0, self.vbw * ppm, self.vbh * ppm)
+
         for name in self.selected:
             g = self._geom_cache.get(name)
             if not g:
                 continue
             is_active = (name == self.active)
             rat_col = _C_ACTIVE if is_active else _C_TODO
-            rat_w = 2.5 if is_active else 1.5
-            gc.SetPen(wx.Pen(rat_col, rat_w, wx.PENSTYLE_SHORT_DASH))
+            rat_w = 3.0 if is_active else 2.0
             for (x1, y1, x2, y2) in self._ratsnest_for(name, g):
-                a, b = S(x1, y1), S(x2, y2)
-                gc.StrokeLine(a[0], a[1], b[0], b[1])
+                glow_line(S(x1, y1), S(x2, y2), rat_col, rat_w, True)
             for (x1, y1, x2, y2, w) in g["tracks"]:
-                gc.SetPen(wx.Pen(_C_KEPT, max(1.0, w * ppm)))
+                gc.SetPen(wx.Pen(_C_KEPT, max(2, int(round(w * ppm)))))
                 a, b = S(x1, y1), S(x2, y2)
                 gc.StrokeLine(a[0], a[1], b[0], b[1])
-            gc.SetBrush(wx.Brush(wx.Colour(255, 235, 59, 150 if is_active else 90)))
-            gc.SetPen(wx.Pen(_C_PAD, 1.0))
+            gc.SetBrush(wx.Brush(wx.Colour(255, 235, 59, 220 if is_active else 150)))
+            gc.SetPen(wx.Pen(_C_PAD, 1.5))
             for (x, y, r) in g["pads"]:
                 cx, cy = S(x, y)
-                rr = max(r * ppm, 4)
+                rr = max(r * ppm, 5)
                 gc.DrawEllipse(cx - rr, cy - rr, 2 * rr, 2 * rr)
 
         for res in self.proposed:
             for (x1, y1, x2, y2, w, lyr) in res.get("segments", []):
-                gc.SetPen(wx.Pen(_C_PROP.get(lyr, _C_PROP_DEFAULT), max(1.0, w * ppm)))
-                a, b = S(x1, y1), S(x2, y2)
-                gc.StrokeLine(a[0], a[1], b[0], b[1])
+                col = _C_PROP.get(lyr, _C_PROP_DEFAULT)
+                glow_line(S(x1, y1), S(x2, y2), col, max(2.2, w * ppm), False)
             gc.SetBrush(wx.Brush(_C_PROP_VIA))
-            gc.SetPen(wx.Pen(wx.Colour(120, 90, 0), 1.0))
+            gc.SetPen(wx.Pen(wx.Colour(255, 255, 255), 1.5))
             for (x, y, dia, drill) in res.get("vias", []):
                 cx, cy = S(x, y)
-                rr = dia / 2.0 * ppm
+                rr = max(dia / 2.0 * ppm, 4)
                 gc.DrawEllipse(cx - rr, cy - rr, 2 * rr, 2 * rr)
 
 
