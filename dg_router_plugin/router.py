@@ -112,6 +112,8 @@ class CostMap:
         self.blocked = [bytearray(n) for _ in self.layers]
         self.via_blocked = bytearray(n)
         self.attract = [bytearray(n) for _ in self.layers]  # bus bundling bonus
+        # clearance + width/2 is the true minimum; add a full cell of
+        # discretization safety so cell-center paths never violate clearance.
         self.track_inflate = clearance + width / 2.0 + pitch
         self.via_inflate = clearance + via_dia / 2.0 + pitch
 
@@ -518,16 +520,23 @@ def route_net(board, net_name, gaps, params, prior_segments=None,
     segments, vias, path_cells_by_layer = [], [], {}
     routed = 0
     for (x1, y1, x2, y2) in gaps:
+        ps = _pad_min_dim(board, net_code, x1, y1)
+        pe = _pad_min_dim(board, net_code, x2, y2)
+        # Enter each pad at a free cell WITHIN the pad copper — never with an
+        # unchecked stub across neighbors (that shorted adjacent pads). If the
+        # pad is boxed in at this resolution, skip the gap (fail, never short).
+        sr = max(1, int((ps or width) / 2.0 / params.pitch))
+        er = max(1, int((pe or width) / 2.0 / params.pitch))
         sl = [lidx[L] for L in _pad_layers_at(board, net_code, x1, y1, routable)]
         gl = [lidx[L] for L in _pad_layers_at(board, net_code, x2, y2, routable)]
         starts = []
         for li in sl:
-            c = nearest_free(cm, li, cm.to_cell(x1, y1))
+            c = nearest_free(cm, li, cm.to_cell(x1, y1), max_rings=sr)
             if c:
                 starts.append((c[0], c[1], li))
         goal_cell = None
         for li in gl:
-            c = nearest_free(cm, li, cm.to_cell(x2, y2))
+            c = nearest_free(cm, li, cm.to_cell(x2, y2), max_rings=er)
             if c:
                 goal_cell = c
                 break
@@ -538,18 +547,14 @@ def route_net(board, net_name, gaps, params, prior_segments=None,
             continue
 
         runs, via_cells = split_layer_runs(cells3)
-        ps = _pad_min_dim(board, net_code, x1, y1)
-        pe = _pad_min_dim(board, net_code, x2, y2)
         neck_s = max(params.min_track, min(width, ps)) if ps else width
         neck_e = max(params.min_track, min(width, pe)) if pe else width
 
         for ri, (li, run) in enumerate(runs):
             path_cells_by_layer.setdefault(li, []).extend(run)
+            # octi_pull is collision-checked; endpoints already sit inside the
+            # pads, so there is NO unchecked stub -> cannot short.
             pts = octi_pull(cm, li, run)
-            if ri == 0:  # attach the start pad
-                pts = _octi_stub((x1, y1), pts[0])[:-1] + pts
-            if ri == len(runs) - 1:  # attach the end pad
-                pts = pts + _octi_stub((x2, y2), pts[-1])[:-1][::-1]
             ns = neck_s if ri == 0 else width
             ne = neck_e if ri == len(runs) - 1 else width
             segments += build_segments(pts, routable[li], width, ns, ne)
