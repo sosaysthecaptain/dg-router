@@ -1,0 +1,11 @@
+# KiCad plugin runtime / outputs
+__pycache__/
+*.pyc
+dg-router-out/
+
+# node (future TS core)
+node_modules/
+dist/
+
+# macOS
+.DS_Store
