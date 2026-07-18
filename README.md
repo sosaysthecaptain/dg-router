@@ -68,10 +68,10 @@ unconnected count before/after; run `kicad-cli pcb drc` to check violations.
 ## Roadmap
 
 1. ✅ M0 — plugin shim: install, choices, live net-highlight preview
-2. ✅ R1 — Python router core: grid A* + string-pull, per-gap routing (so a
-   partial net gets completed, not restarted), obstacle costmap, writes to a
-   COPY, DRC-verified via kicad-cli
-3. DRC-feedback loop: re-route offenders with penalty regions (spec's design)
+2. ✅ R1 — Python router core: OCTILINEAR turn-penalized grid A*, per-net
+   width/clearance from the effective NETCLASS (with board-min floor), neck-down
+   into narrower pads, per-gap routing (completes partial nets), DRC-verified
+3. DRC-feedback loop + rip-up: re-route offenders/greedy-order failures
 4. Vias / multi-layer (currently single-layer only)
 5. Costmap heatmap + before/after diff renders
 6. "Route" button in the plugin (drive from the GUI)

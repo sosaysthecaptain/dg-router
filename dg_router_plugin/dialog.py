@@ -31,42 +31,9 @@ _BG = wx.Colour(24, 24, 24)
 
 _BG_PPM = 10.0  # background raster resolution (px per mm)
 
-# status icon colors
-_ICO_ROUTED = wx.Colour(46, 204, 113)
-_ICO_PARTIAL = wx.Colour(241, 196, 15)
-_ICO_UNROUTED = wx.Colour(120, 120, 120)
-_ICON_SZ = 16
-
-
-def _status_icon(kind):
-    """A small transparent bitmap: green check-circle (routed), amber
-    dash-circle (partial), grey ring (unrouted), or blank (unknown)."""
-    sz = _ICON_SZ
-    bmp = wx.Bitmap.FromRGBA(sz, sz, 0, 0, 0, 0)
-    dc = wx.MemoryDC(bmp)
-    gc = wx.GraphicsContext.Create(dc)
-    if kind == "routed":
-        gc.SetBrush(wx.Brush(_ICO_ROUTED))
-        gc.SetPen(wx.Pen(_ICO_ROUTED, 1))
-        gc.DrawEllipse(1, 1, sz - 2, sz - 2)
-        gc.SetPen(wx.Pen(wx.Colour(255, 255, 255), 2))
-        p = gc.CreatePath()
-        p.MoveToPoint(4.5, 8.5)
-        p.AddLineToPoint(7.0, 11.0)
-        p.AddLineToPoint(11.5, 5.0)
-        gc.StrokePath(p)
-    elif kind == "partial":
-        gc.SetBrush(wx.Brush(_ICO_PARTIAL))
-        gc.SetPen(wx.Pen(_ICO_PARTIAL, 1))
-        gc.DrawEllipse(1, 1, sz - 2, sz - 2)
-        gc.SetPen(wx.Pen(wx.Colour(255, 255, 255), 2))
-        gc.StrokeLine(4.5, 8, 11.5, 8)
-    elif kind == "unrouted":
-        gc.SetBrush(wx.Brush(wx.Colour(0, 0, 0, 0)))
-        gc.SetPen(wx.Pen(_ICO_UNROUTED, 1.5))
-        gc.DrawEllipse(2, 2, sz - 4, sz - 4)
-    dc.SelectObject(wx.NullBitmap)
-    return bmp
+# right-column status glyphs (emoji render in DataViewListCtrl reliably;
+# custom bitmaps did not on macOS)
+_STATUS_EMOJI = {None: "", "routed": "✅", "partial": "🟡", "unrouted": "⚪"}
 
 
 class PreviewPanel(wx.Panel):
@@ -77,6 +44,8 @@ class PreviewPanel(wx.Panel):
         super().__init__(parent, style=wx.BORDER_SIMPLE)
         self.board = board
         self.bg_bmp = None
+        self._scaled = None          # bg pre-scaled to the current draw size
+        self._scaled_size = None
         self.origin = None
         self.err = None
         self.selected = []
@@ -84,6 +53,7 @@ class PreviewPanel(wx.Panel):
         self.unconn = {}
         self.status_loaded = False
         self.SetBackgroundStyle(wx.BG_STYLE_PAINT)
+        self.SetBackgroundColour(_BG)
         self.Bind(wx.EVT_PAINT, self.on_paint)
         self.Bind(wx.EVT_ERASE_BACKGROUND, lambda e: None)  # kill flicker
         self._last_size = (0, 0)
@@ -171,8 +141,15 @@ class PreviewPanel(wx.Panel):
         dw, dh = int(bw * scale), int(bh * scale)
         ox, oy = (cs.width - dw) // 2, (cs.height - dh) // 2
 
+        # Pre-scale the board bitmap once per draw-size (scaling every paint via
+        # GraphicsContext is slow and is what makes re-activation blink).
+        if self._scaled_size != (dw, dh):
+            self._scaled = self.bg_bmp.ConvertToImage().Scale(
+                dw, dh, wx.IMAGE_QUALITY_NORMAL).ConvertToBitmap()
+            self._scaled_size = (dw, dh)
+
         gc = wx.GraphicsContext.Create(dc)
-        gc.DrawBitmap(self.bg_bmp, ox, oy, dw, dh)
+        gc.DrawBitmap(self._scaled, ox, oy, dw, dh)
 
         eff = _BG_PPM * scale
         orx, ory = self.origin
@@ -221,8 +198,6 @@ class RouterDialog(wx.Dialog):
         self.nets = shim.list_nets(board)
         self.layers = shim.copper_layer_names(board)
         self.status_map = {}
-        self._icons = {k: _status_icon(k)
-                       for k in (None, "routed", "partial", "unrouted")}
 
         panel = wx.Panel(self)
         panel.SetDoubleBuffered(True)  # kill dialog-wide blink on re-activation
@@ -239,15 +214,14 @@ class RouterDialog(wx.Dialog):
         self.net_list.AppendToggleColumn("", width=28,
                                          mode=dv.DATAVIEW_CELL_ACTIVATABLE)
         self.net_list.AppendTextColumn("Net", width=232)
-        # DataViewListCtrl.AppendBitmapColumn wants positional args (label,
-        # model_column, mode, width, align) — keywords aren't accepted.
-        self.net_list.AppendBitmapColumn("", self.COL_STATUS,
-                                         dv.DATAVIEW_CELL_INERT, 40,
-                                         wx.ALIGN_CENTER)
+        # right-aligned status glyph column (positional args: label, mode,
+        # width, align)
+        self.net_list.AppendTextColumn("", dv.DATAVIEW_CELL_INERT, 48,
+                                       wx.ALIGN_RIGHT)
         for n in self.nets:
             self.net_list.AppendItem(
                 [False, "%s  (%d pads)" % (n["name"], n["pads"]),
-                 self._icons[None]])
+                 _STATUS_EMOJI[None]])
         left.Add(self.net_list, 1, wx.EXPAND | wx.ALL, 8)
 
         grid = wx.FlexGridSizer(cols=2, vgap=6, hgap=8)
@@ -311,8 +285,9 @@ class RouterDialog(wx.Dialog):
 
     def _apply_status_icons(self):
         for i, n in enumerate(self.nets):
-            self.net_list.SetValue(self._icons[self.status_map.get(n["name"])],
-                                   i, self.COL_STATUS)
+            self.net_list.SetValue(
+                _STATUS_EMOJI.get(self.status_map.get(n["name"]), ""),
+                i, self.COL_STATUS)
 
     def _load_status(self):
         try:
@@ -435,10 +410,10 @@ class RouterDialog(wx.Dialog):
                 done.append((name, "already routed"))
                 continue
             r = router.route_net(self.board, name, gaps, params, prefer)
-            polys = r.get("polylines")
-            if polys:
-                added += router.write_polylines(
-                    self.board, r["net_code"], r["layer_id"], polys, params.width)
+            segs = r.get("segments")
+            if segs:
+                added += router.write_segments(
+                    self.board, r["net_code"], r["layer_id"], segs)
             if r.get("ok"):
                 done.append((name, "layer %s" % r.get("layer")))
             else:
@@ -446,10 +421,7 @@ class RouterDialog(wx.Dialog):
                     ("routed %d/%d gaps" % (r.get("routed", 0), r.get("gaps", 0)))
                 failed.append((name, reason))
 
-        try:
-            pcbnew.ZONE_FILLER(self.board).Fill(self.board.Zones())
-        except Exception:
-            pass
+        router.refill_zones(self.board)
         try:
             self.board.BuildConnectivity()
             pcbnew.Refresh()

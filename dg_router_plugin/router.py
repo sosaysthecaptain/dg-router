@@ -1,72 +1,35 @@
-"""dg-router routing core — single/greedy net router (pure Python + pcbnew).
+"""dg-router routing core — octilinear, netclass-aware grid router (pcbnew).
 
-Milestone R1: route the DRC gaps of a net on a single copper layer with a grid
-A*, string-pull the path to an any-angle polyline, and write tracks back to a
-COPY of the board (never the original). kicad-cli DRC is the ground-truth check.
+Routes each DRC gap of a net on a single copper layer:
+- per-net width/clearance come from the net's effective NETCLASS (not a global
+  guess), via board connectivity NET_SETTINGS
+- A* is turn-penalized on an 8-connected grid and the path is reduced to
+  OCTILINEAR segments (0/45/90 only) — no arbitrary-angle diagonals
+- the branch into a pad NECKS DOWN when the pad is narrower than the net width
+- existing same-net copper is never an obstacle, so partial nets are completed
+- writes to a COPY (headless) or the in-memory board (GUI); kicad-cli DRC is the
+  ground-truth check
 
-Design choices that matter:
-- We route each *gap* reported by the DRC oracle (shim.drc_unconnected), not
-  pad-to-pad from scratch. Existing same-net copper is NOT an obstacle, so a
-  partially-routed net gets completed, never restarted.
-- Obstacles = other nets' pads/tracks/vias (clearance-inflated) + a board-edge
-  margin, stamped onto a per-layer boolean grid.
-- No vias yet (single layer). Nets whose gap endpoints don't share a copper
-  layer are reported as skipped, not silently dropped.
+No vias yet (single layer): nets whose endpoints don't share a copper layer are
+reported skipped, not silently dropped.
 """
 
-import os
 import math
 import heapq
 
 import pcbnew
 
 try:
-    from . import shim            # imported as part of the package (GUI)
+    from . import shim
 except ImportError:
-    import shim                   # imported flat (headless, package dir on path)
+    import shim
 
 _NM = 1e6
 
-
-class RouteParams:
-    def __init__(self, board, pitch_mm=0.15, clearance_mm=None, width_mm=None,
-                 edge_margin_mm=None):
-        ds = board.GetDesignSettings()
-        self.pitch = pitch_mm
-        self.clearance = clearance_mm if clearance_mm is not None \
-            else _safe(lambda: ds.m_MinClearance / _NM, 0.2)
-        self.width = width_mm if width_mm is not None else _dominant_width(board, ds)
-        self.edge_margin = edge_margin_mm if edge_margin_mm is not None \
-            else _safe(lambda: ds.m_CopperEdgeClearance / _NM, 0.3) or 0.3
-        # obstacle inflation: keep the trace CENTER at least this far from other
-        # copper so a full-width track clears it, plus a grid-discretization margin.
-        self.inflate = self.clearance + self.width / 2.0 + self.pitch
-
-
-def _via_width_mm(via, layer):
-    """Via width in mm. The no-arg PCB_VIA.GetWidth() raises SystemError under a
-    running wx.App (i.e. inside KiCad) in KiCad 10 — the layer-arg form works."""
-    for L in (layer, pcbnew.F_Cu, pcbnew.B_Cu):
-        try:
-            w = via.GetWidth(L)
-            if w:
-                return w / _NM
-        except Exception:
-            continue
-    return 0.6
-
-
-def _dominant_width(board, ds):
-    """Most common existing track width (matches the board's real netclass),
-    falling back to the design minimum."""
-    from collections import Counter
-    ws = Counter()
-    for t in board.GetTracks():
-        if t.Type() == pcbnew.PCB_TRACE_T:
-            ws[t.GetWidth()] += 1
-    if ws:
-        return ws.most_common(1)[0][0] / _NM
-    return _safe(lambda: ds.m_TrackMinWidth / _NM, 0.25) or 0.25
+# 8 directions in ANGULAR order (45deg apart) so turn cost = index distance.
+_DIRS = [(1, 0), (1, 1), (0, 1), (-1, 1),
+         (-1, 0), (-1, -1), (0, -1), (1, -1)]
+_NODIR = 8
 
 
 def _safe(fn, default):
@@ -77,26 +40,66 @@ def _safe(fn, default):
         return default
 
 
+def _sgn(v):
+    return (v > 0) - (v < 0)
+
+
+def _via_width_mm(via, layer):
+    """No-arg PCB_VIA.GetWidth() raises under a running wx.App (KiCad GUI) in
+    KiCad 10; the layer-arg form works."""
+    for L in (layer, pcbnew.F_Cu, pcbnew.B_Cu):
+        try:
+            w = via.GetWidth(L)
+            if w:
+                return w / _NM
+        except Exception:
+            continue
+    return 0.6
+
+
+class RouteParams:
+    """Global routing params. Per-net width/clearance are resolved from the
+    net's netclass at route time."""
+
+    def __init__(self, board, pitch_mm=0.2, turn_cost=0.7):
+        ds = board.GetDesignSettings()
+        self.pitch = pitch_mm
+        self.turn_cost = turn_cost
+        # board-setup hard floors (enforced regardless of netclass)
+        self.edge_clearance = _safe(lambda: ds.m_CopperEdgeClearance / _NM, 0.3)
+        self.min_track = _safe(lambda: ds.m_TrackMinWidth / _NM, 0.2)
+        try:
+            self.netsettings = board.GetConnectivity().GetNetSettings()
+        except Exception:
+            self.netsettings = None
+
+    def net_class(self, net_name):
+        """(track_width_mm, clearance_mm) for a net from its effective netclass."""
+        if self.netsettings is not None:
+            try:
+                nc = self.netsettings.GetEffectiveNetClass(net_name)
+                return nc.GetTrackWidth() / _NM, nc.GetClearance() / _NM
+            except Exception:
+                pass
+        return 0.2, 0.2
+
+
 # --- costmap ---------------------------------------------------------------
 
 class CostMap:
-    """Per-layer boolean obstacle grid over the board edges bbox."""
-
-    def __init__(self, board, layer_id, net_code, params):
-        self.p = params
+    def __init__(self, board, layer_id, net_code, pitch, edge_margin,
+                 clearance, width):
         bb = board.GetBoardEdgesBoundingBox()
         self.x0 = bb.GetX() / _NM
         self.y0 = bb.GetY() / _NM
-        w = bb.GetWidth() / _NM
-        h = bb.GetHeight() / _NM
-        self.pitch = params.pitch
-        self.nx = max(1, int(math.ceil(w / self.pitch)))
-        self.ny = max(1, int(math.ceil(h / self.pitch)))
+        self.pitch = pitch
+        self.nx = max(1, int(math.ceil(bb.GetWidth() / _NM / pitch)))
+        self.ny = max(1, int(math.ceil(bb.GetHeight() / _NM / pitch)))
         self.blocked = bytearray(self.nx * self.ny)
-        self._stamp_edge_margin()
+        self.inflate = clearance + width / 2.0 + pitch
+        self._stamp_edge(edge_margin)
         self._stamp_obstacles(board, layer_id, net_code)
 
-    # index / coordinate helpers
     def idx(self, i, j):
         return j * self.nx + i
 
@@ -112,15 +115,21 @@ class CostMap:
     def is_blocked(self, i, j):
         return self.blocked[self.idx(i, j)]
 
-    # --- rasterization ---
-    def _stamp_edge_margin(self):
-        m = int(math.ceil(self.p.edge_margin / self.pitch))
-        for j in range(self.ny):
-            for i in range(self.nx):
-                if i < m or j < m or i >= self.nx - m or j >= self.ny - m:
-                    self.blocked[self.idx(i, j)] = 1
+    def _stamp_edge(self, margin):
+        m = int(math.ceil(margin / self.pitch))
+        nx, ny = self.nx, self.ny
+        for j in range(ny):
+            border = j < m or j >= ny - m
+            base = j * nx
+            if border:
+                for i in range(nx):
+                    self.blocked[base + i] = 1
+            else:
+                for i in range(m):
+                    self.blocked[base + i] = 1
+                    self.blocked[base + nx - 1 - i] = 1
 
-    def _stamp_disc(self, cx, cy, r):
+    def _disc(self, cx, cy, r):
         p = self.pitch
         i0 = max(0, int((cx - r - self.x0) / p))
         i1 = min(self.nx - 1, int((cx + r - self.x0) / p))
@@ -129,114 +138,44 @@ class CostMap:
         r2 = r * r
         for j in range(j0, j1 + 1):
             wy = self.y0 + (j + 0.5) * p
+            row = j * self.nx
             for i in range(i0, i1 + 1):
                 wx = self.x0 + (i + 0.5) * p
                 if (wx - cx) ** 2 + (wy - cy) ** 2 <= r2:
-                    self.blocked[self.idx(i, j)] = 1
+                    self.blocked[row + i] = 1
 
-    def _stamp_segment(self, x1, y1, x2, y2, r):
+    def _segment(self, x1, y1, x2, y2, r):
         length = math.hypot(x2 - x1, y2 - y1)
         steps = max(1, int(length / (self.pitch * 0.5)))
         for s in range(steps + 1):
             t = s / steps
-            self._stamp_disc(x1 + (x2 - x1) * t, y1 + (y2 - y1) * t, r)
-
-    def carve_disc(self, cx, cy, r):
-        """Clear a disc (used around our own gap endpoints)."""
-        p = self.pitch
-        i0 = max(0, int((cx - r - self.x0) / p))
-        i1 = min(self.nx - 1, int((cx + r - self.x0) / p))
-        j0 = max(0, int((cy - r - self.y0) / p))
-        j1 = min(self.ny - 1, int((cy + r - self.y0) / p))
-        r2 = r * r
-        for j in range(j0, j1 + 1):
-            wy = self.y0 + (j + 0.5) * p
-            for i in range(i0, i1 + 1):
-                wx = self.x0 + (i + 0.5) * p
-                if (wx - cx) ** 2 + (wy - cy) ** 2 <= r2:
-                    self.blocked[self.idx(i, j)] = 0
+            self._disc(x1 + (x2 - x1) * t, y1 + (y2 - y1) * t, r)
 
     def _stamp_obstacles(self, board, layer_id, net_code):
-        clr = self.p.inflate
-        # pads (other nets) present on this layer, or PTH (all layers)
+        clr = self.inflate
         for pad in board.GetPads():
-            if pad.GetNetCode() == net_code:
-                continue
-            if not pad.IsOnLayer(layer_id):
+            if pad.GetNetCode() == net_code or not pad.IsOnLayer(layer_id):
                 continue
             pos = pad.GetPosition()
             sz = pad.GetSize()
-            # circumscribe the (possibly rectangular) pad — half-DIAGONAL, so
-            # corners can't poke past the disc — then inflate for clearance.
-            r = math.hypot(sz.x, sz.y) / 2.0 / _NM + clr
-            self._stamp_disc(pos.x / _NM, pos.y / _NM, r)
-        # tracks / vias (other nets)
+            self._disc(pos.x / _NM, pos.y / _NM,
+                       math.hypot(sz.x, sz.y) / 2.0 / _NM + clr)
         for t in board.GetTracks():
             if t.GetNetCode() == net_code:
                 continue
             if t.Type() == pcbnew.PCB_VIA_T:
                 pos = t.GetPosition()
-                r = _via_width_mm(t, layer_id) / 2.0 + clr
-                self._stamp_disc(pos.x / _NM, pos.y / _NM, r)
+                self._disc(pos.x / _NM, pos.y / _NM,
+                           _via_width_mm(t, layer_id) / 2.0 + clr)
             elif t.IsOnLayer(layer_id):
                 s, e = t.GetStart(), t.GetEnd()
-                r = t.GetWidth() / 2.0 / _NM + clr
-                self._stamp_segment(s.x / _NM, s.y / _NM, e.x / _NM, e.y / _NM, r)
+                self._segment(s.x / _NM, s.y / _NM, e.x / _NM, e.y / _NM,
+                              t.GetWidth() / 2.0 / _NM + clr)
 
 
-# --- A* + string pull ------------------------------------------------------
+# --- A* (turn-penalized) + octilinear reduction ----------------------------
 
-_DIRS = [(-1, 0), (1, 0), (0, -1), (0, 1),
-         (-1, -1), (-1, 1), (1, -1), (1, 1)]
-
-
-def astar(cm, start, goal, max_expansions=2_000_000):
-    if not cm.in_bounds(*start) or not cm.in_bounds(*goal):
-        return None
-    if cm.is_blocked(*goal) or cm.is_blocked(*start):
-        return None
-    sx, sy = start
-    gx, gy = goal
-
-    def h(i, j):
-        dx, dy = abs(i - gx), abs(j - gy)
-        return (dx + dy) + (math.sqrt(2) - 2) * min(dx, dy)
-
-    open_heap = [(h(sx, sy), 0.0, start)]
-    gscore = {start: 0.0}
-    came = {}
-    seen = 0
-    while open_heap:
-        _, g, cur = heapq.heappop(open_heap)
-        if cur == goal:
-            return _reconstruct(came, cur)
-        if g > gscore.get(cur, 1e18):
-            continue
-        seen += 1
-        if seen > max_expansions:
-            return None
-        ci, cj = cur
-        for di, dj in _DIRS:
-            ni, nj = ci + di, cj + dj
-            if not cm.in_bounds(ni, nj) or cm.is_blocked(ni, nj):
-                continue
-            if di and dj:  # no diagonal corner-cutting
-                if cm.is_blocked(ci + di, cj) or cm.is_blocked(ci, cj + dj):
-                    continue
-                step = math.sqrt(2)
-            else:
-                step = 1.0
-            ng = g + step
-            nxt = (ni, nj)
-            if ng < gscore.get(nxt, 1e18):
-                gscore[nxt] = ng
-                came[nxt] = cur
-                heapq.heappush(open_heap, (ng + h(ni, nj), ng, nxt))
-    return None
-
-
-def nearest_free(cm, cell, max_rings=12):
-    """Nearest non-blocked cell to `cell` (spiral search), or None."""
+def nearest_free(cm, cell, max_rings=14):
     ci, cj = cell
     if cm.in_bounds(ci, cj) and not cm.is_blocked(ci, cj):
         return cell
@@ -254,65 +193,148 @@ def nearest_free(cm, cell, max_rings=12):
     return None
 
 
-def _reconstruct(came, cur):
-    path = [cur]
-    while cur in came:
-        cur = came[cur]
-        path.append(cur)
-    path.reverse()
-    return path
+def astar(cm, start, goal, turn_cost, max_expansions=1_500_000):
+    if not (cm.in_bounds(*start) and cm.in_bounds(*goal)):
+        return None
+    if cm.is_blocked(*start) or cm.is_blocked(*goal):
+        return None
+    gx, gy = goal
+
+    def h(i, j):
+        dx, dy = abs(i - gx), abs(j - gy)
+        return (dx + dy) - (2 - math.sqrt(2)) * min(dx, dy)
+
+    start_state = (start[0], start[1], _NODIR)
+    open_heap = [(h(*start), 0.0, start_state)]
+    g = {start_state: 0.0}
+    came = {}
+    seen = 0
+    while open_heap:
+        _, gc, st = heapq.heappop(open_heap)
+        ci, cj, cd = st
+        if (ci, cj) == goal:
+            return _reconstruct(came, st)
+        if gc > g.get(st, 1e18):
+            continue
+        seen += 1
+        if seen > max_expansions:
+            return None
+        for nd, (di, dj) in enumerate(_DIRS):
+            ni, nj = ci + di, cj + dj
+            if not cm.in_bounds(ni, nj) or cm.is_blocked(ni, nj):
+                continue
+            if di and dj:  # block diagonal corner-cutting
+                if cm.is_blocked(ci + di, cj) or cm.is_blocked(ci, cj + dj):
+                    continue
+                step = math.sqrt(2)
+            else:
+                step = 1.0
+            turn = 0 if cd == _NODIR else min(abs(cd - nd), 8 - abs(cd - nd))
+            ng = gc + step + turn * turn_cost
+            nst = (ni, nj, nd)
+            if ng < g.get(nst, 1e18):
+                g[nst] = ng
+                came[nst] = st
+                heapq.heappush(open_heap, (ng + h(ni, nj), ng, nst))
+    return None
 
 
-def _los(cm, a, b):
-    """Strict line-of-sight: densely sample the segment (sub-cell steps) and
-    reject if any sampled cell is blocked or out of bounds."""
-    (ai, aj), (bi, bj) = a, b
-    dist = math.hypot(bi - ai, bj - aj)
-    n = max(1, int(dist / 0.25))
-    for s in range(n + 1):
-        t = s / n
-        i = int(round(ai + (bi - ai) * t))
-        j = int(round(aj + (bj - aj) * t))
-        if not cm.in_bounds(i, j) or cm.is_blocked(i, j):
-            return False
-    return True
+def _reconstruct(came, st):
+    cells = [(st[0], st[1])]
+    while st in came:
+        st = came[st]
+        cells.append((st[0], st[1]))
+    cells.reverse()
+    return cells
 
 
-def string_pull(cm, cells):
-    """Reduce a grid path to a minimal any-angle polyline of cells."""
-    if len(cells) <= 2:
-        return list(cells)
-    out = [cells[0]]
-    i = 0
-    while i < len(cells) - 1:
-        j = len(cells) - 1
-        while j > i + 1 and not _los(cm, cells[i], cells[j]):
-            j -= 1
-        out.append(cells[j])
-        i = j
-    return out
+def octilinear_polyline(cm, cells):
+    """Keep only bend points -> octilinear polyline (segments are all 0/45/90
+    because A* moves are 8-directional)."""
+    if len(cells) <= 1:
+        return [cm.to_world(*c) for c in cells]
+    keep = [cells[0]]
+    prev = (_sgn(cells[1][0] - cells[0][0]), _sgn(cells[1][1] - cells[0][1]))
+    for k in range(1, len(cells) - 1):
+        d = (_sgn(cells[k + 1][0] - cells[k][0]),
+             _sgn(cells[k + 1][1] - cells[k][1]))
+        if d != prev:
+            keep.append(cells[k])
+            prev = d
+    keep.append(cells[-1])
+    return [cm.to_world(*c) for c in keep]
+
+
+# --- neck-down + segment building ------------------------------------------
+
+def _pt_along(a, b, dist):
+    dx, dy = b[0] - a[0], b[1] - a[1]
+    L = math.hypot(dx, dy)
+    if L <= dist:
+        return None
+    t = dist / L
+    return (a[0] + dx * t, a[1] + dy * t)
+
+
+def _pad_min_dim(board, net_code, x, y):
+    best, bd = None, 1e18
+    for pad in board.GetPads():
+        if pad.GetNetCode() != net_code:
+            continue
+        p = pad.GetPosition()
+        d = math.hypot(p.x / _NM - x, p.y / _NM - y)
+        if d < bd:
+            bd = d
+            sz = pad.GetSize()
+            best = min(sz.x, sz.y) / _NM
+    return best
+
+
+def build_segments(pts, main_w, neck_start, neck_end, neck_len=0.5):
+    """Polyline -> [(x1,y1,x2,y2,w)], necking a short stub at each end that
+    needs it. Splits stay on the (octilinear) segment so angles are preserved."""
+    pts = list(pts)
+    if len(pts) < 2:
+        return []
+    if neck_start < main_w:
+        q = _pt_along(pts[0], pts[1], neck_len)
+        if q is not None:
+            pts.insert(1, q)
+    if neck_end < main_w:
+        q = _pt_along(pts[-1], pts[-2], neck_len)
+        if q is not None:
+            pts.insert(len(pts) - 1, q)
+    n = len(pts) - 1
+    segs = []
+    for i in range(n):
+        w = main_w
+        if i == 0 and neck_start < main_w:
+            w = neck_start
+        if i == n - 1 and neck_end < main_w:
+            w = neck_end
+        segs.append((pts[i][0], pts[i][1], pts[i + 1][0], pts[i + 1][1], w))
+    return segs
 
 
 # --- orchestration ---------------------------------------------------------
 
-def _pad_layers(board, net_code):
-    layers = {pcbnew.F_Cu: True, pcbnew.B_Cu: True}
-    result = {pcbnew.F_Cu: 0, pcbnew.B_Cu: 0}
-    total = 0
-    for pad in board.GetPads():
-        if pad.GetNetCode() != net_code:
-            continue
-        total += 1
-        for l in (pcbnew.F_Cu, pcbnew.B_Cu):
-            if not pad.IsOnLayer(l):
-                layers[l] = False
-    common = [l for l in (pcbnew.F_Cu, pcbnew.B_Cu) if layers[l]]
-    return common
+def _find_net(board, net_name):
+    for c in range(1, board.GetNetCount()):
+        n = board.FindNet(c)
+        if n and n.GetNetname() == net_name:
+            return n
+    return None
 
 
 def choose_layer(board, net_code, prefer_name=None):
-    """A single copper layer that every pad on the net can reach, or None."""
-    common = _pad_layers(board, net_code)
+    on = {pcbnew.F_Cu: True, pcbnew.B_Cu: True}
+    for pad in board.GetPads():
+        if pad.GetNetCode() != net_code:
+            continue
+        for L in (pcbnew.F_Cu, pcbnew.B_Cu):
+            if not pad.IsOnLayer(L):
+                on[L] = False
+    common = [L for L in (pcbnew.F_Cu, pcbnew.B_Cu) if on[L]]
     if not common:
         return None
     if prefer_name:
@@ -323,77 +345,80 @@ def choose_layer(board, net_code, prefer_name=None):
 
 
 def route_net(board, net_name, gaps, params, prefer_name=None):
-    """Route each gap of a net on one layer. Returns dict with polylines (mm)
-    and per-gap status."""
-    net = None
-    for c in range(1, board.GetNetCount()):
-        n = board.FindNet(c)
-        if n and n.GetNetname() == net_name:
-            net = n
-            break
+    net = _find_net(board, net_name)
     if net is None:
         return {"net": net_name, "ok": False, "reason": "net not found"}
+    net_code = net.GetNetCode()
 
-    layer_id = choose_layer(board, net.GetNetCode(), prefer_name)
+    layer_id = choose_layer(board, net_code, prefer_name)
     if layer_id is None:
         return {"net": net_name, "ok": False,
-                "reason": "pads not on a common layer (needs via — not yet)"}
+                "reason": "pads not on a common layer (needs a via — not yet)"}
 
-    cm = CostMap(board, layer_id, net.GetNetCode(), params)
-    polylines = []
+    nc_width, clearance = params.net_class(net_name)
+    # the board minimum track width is a hard floor above the netclass width
+    width = max(nc_width, params.min_track)
+    # edge stamp keeps the track EDGE clear of the board edge (rule + width/2)
+    edge_m = params.edge_clearance + width / 2.0 + params.pitch
+    cm = CostMap(board, layer_id, net_code, params.pitch, edge_m,
+                 clearance, width)
+
+    segments = []
     routed = 0
     for (x1, y1, x2, y2) in gaps:
-        # Route from the free cell nearest each pad (the costmap stays honest —
-        # no carving away real clearance). The final segment snaps to the exact
-        # pad center below.
         start = nearest_free(cm, cm.to_cell(x1, y1))
         goal = nearest_free(cm, cm.to_cell(x2, y2))
         if start is None or goal is None:
             continue
-        cells = astar(cm, start, goal)
+        cells = astar(cm, start, goal, params.turn_cost)
         if not cells:
             continue
-        pulled = string_pull(cm, cells)
-        pts = [cm.to_world(i, j) for (i, j) in pulled]
-        # snap the true endpoints exactly onto the pads
-        pts[0] = (x1, y1)
-        pts[-1] = (x2, y2)
-        polylines.append(pts)
+        pts = octilinear_polyline(cm, cells)
+        if len(pts) < 2:
+            continue
+        # neck each end down to the pad if the pad is narrower than the net width
+        ps = _pad_min_dim(board, net_code, x1, y1)
+        pe = _pad_min_dim(board, net_code, x2, y2)
+        neck_s = max(params.min_track, min(width, ps)) if ps else width
+        neck_e = max(params.min_track, min(width, pe)) if pe else width
+        segments += build_segments(pts, width, neck_s, neck_e)
         routed += 1
 
-    return {
-        "net": net_name, "ok": routed == len(gaps) and len(gaps) > 0,
-        "layer": board.GetLayerName(layer_id),
-        "gaps": len(gaps), "routed": routed, "polylines": polylines,
-        "net_code": net.GetNetCode(), "layer_id": layer_id,
-    }
+    return {"net": net_name, "ok": routed == len(gaps) and len(gaps) > 0,
+            "layer": board.GetLayerName(layer_id), "gaps": len(gaps),
+            "routed": routed, "segments": segments, "net_code": net_code,
+            "layer_id": layer_id, "width": width}
 
 
-def write_polylines(board, net_code, layer_id, polylines, width_mm):
+def write_segments(board, net_code, layer_id, segments):
     n = 0
-    w = int(round(width_mm * _NM))
-    for pts in polylines:
-        for k in range(len(pts) - 1):
-            (x1, y1), (x2, y2) = pts[k], pts[k + 1]
-            t = pcbnew.PCB_TRACK(board)
-            t.SetStart(pcbnew.VECTOR2I(int(round(x1 * _NM)), int(round(y1 * _NM))))
-            t.SetEnd(pcbnew.VECTOR2I(int(round(x2 * _NM)), int(round(y2 * _NM))))
-            t.SetWidth(w)
-            t.SetLayer(layer_id)
-            t.SetNetCode(net_code)
-            board.Add(t)
-            n += 1
+    for (x1, y1, x2, y2, w) in segments:
+        t = pcbnew.PCB_TRACK(board)
+        t.SetStart(pcbnew.VECTOR2I(int(round(x1 * _NM)), int(round(y1 * _NM))))
+        t.SetEnd(pcbnew.VECTOR2I(int(round(x2 * _NM)), int(round(y2 * _NM))))
+        t.SetWidth(int(round(w * _NM)))
+        t.SetLayer(layer_id)
+        t.SetNetCode(net_code)
+        board.Add(t)
+        n += 1
     return n
 
 
+def refill_zones(board):
+    try:
+        pcbnew.ZONE_FILLER(board).Fill(board.Zones())
+    except Exception:
+        pass
+
+
 def solve(board_path, net_names, out_path, params=None, prefer_name=None):
-    """Route the given nets, write tracks to a COPY at out_path, return summary."""
+    import os
     board = pcbnew.LoadBoard(board_path)
     params = params or RouteParams(board)
     unconn = shim.drc_unconnected(board_path)
 
     results = []
-    total_tracks = 0
+    total = 0
     for name in net_names:
         gaps = unconn.get(name, [])
         if not gaps:
@@ -401,20 +426,13 @@ def solve(board_path, net_names, out_path, params=None, prefer_name=None):
                             "gaps": 0, "routed": 0})
             continue
         r = route_net(board, name, gaps, params, prefer_name)
-        if r.get("polylines"):
-            total_tracks += write_polylines(board, r["net_code"], r["layer_id"],
-                                            r["polylines"], params.width)
-        r.pop("polylines", None)
+        if r.get("segments"):
+            total += write_segments(board, r["net_code"], r["layer_id"],
+                                    r["segments"])
+        r.pop("segments", None)
         results.append(r)
 
-    # Refill copper zones so DRC doesn't flag stale pad-to-zone clearances.
-    try:
-        pcbnew.ZONE_FILLER(board).Fill(board.Zones())
-    except Exception:
-        pass
-
+    refill_zones(board)
     os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
     pcbnew.SaveBoard(out_path, board)
-    return {"out": out_path, "tracks_added": total_tracks, "results": results,
-            "params": {"pitch": params.pitch, "clearance": params.clearance,
-                       "width": params.width}}
+    return {"out": out_path, "tracks_added": total, "results": results}
