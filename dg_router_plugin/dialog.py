@@ -11,10 +11,12 @@ import json
 import tempfile
 import webbrowser
 
+import pcbnew
 import wx
 import wx.svg
 
 from . import shim
+from . import router
 
 # highlight colors
 _C_PAD = wx.Colour(255, 235, 59)     # bright yellow — net membership
@@ -161,7 +163,7 @@ class PreviewPanel(wx.Panel):
 
 class RouterDialog(wx.Dialog):
     def __init__(self, board):
-        super().__init__(None, title="dg-router — Milestone 0 shim",
+        super().__init__(None, title="dg-router",
                          size=(940, 720),
                          style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER)
         self.board = board
@@ -202,6 +204,12 @@ class RouterDialog(wx.Dialog):
         self.follow.SetValue(True)
         left.Add(self.follow, 0, wx.LEFT | wx.BOTTOM, 8)
 
+        self.btn_route = wx.Button(panel, label="Route checked ▶")
+        self.btn_route.SetToolTip("Route the checked nets into the board "
+                                  "(in memory — Save to keep, or close without "
+                                  "saving to discard)")
+        left.Add(self.btn_route, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.TOP, 8)
+
         btns = wx.BoxSizer(wx.HORIZONTAL)
         self.btn_open = wx.Button(panel, label="Open full SVG")
         self.btn_emit = wx.Button(panel, label="Emit job.json")
@@ -211,7 +219,7 @@ class RouterDialog(wx.Dialog):
         btns.Add(wx.Button(panel, wx.ID_CANCEL, label="Close"), 0)
         left.Add(btns, 0, wx.EXPAND | wx.ALL, 8)
 
-        self.status = wx.StaticText(panel, label="Shim mode: no routing performed.")
+        self.status = wx.StaticText(panel, label="Ready.")
         left.Add(self.status, 0, wx.ALL, 8)
 
         # --- right column: live preview -----------------------------------
@@ -226,6 +234,7 @@ class RouterDialog(wx.Dialog):
         self.net_list.Bind(wx.EVT_CHECKLISTBOX, self.on_selection)
         self.btn_open.Bind(wx.EVT_BUTTON, self.on_open)
         self.btn_emit.Bind(wx.EVT_BUTTON, self.on_emit)
+        self.btn_route.Bind(wx.EVT_BUTTON, self.on_route)
 
         # DRC routing-status is slow-ish; load it after the dialog is visible.
         if self.board.GetFileName():
@@ -304,6 +313,63 @@ class RouterDialog(wx.Dialog):
             return
         webbrowser.open("file://" + out)
         self.status.SetLabel("Rendered: %s" % out)
+
+    def on_route(self, _evt):
+        names = self.selected_net_names()
+        if not names:
+            wx.MessageBox("Check one or more nets to route first.", "dg-router")
+            return
+        bp = self.board.GetFileName()
+        if not bp or not os.path.exists(bp):
+            wx.MessageBox("Save the board first so the router can read DRC gaps.",
+                          "dg-router")
+            return
+
+        wx.BeginBusyCursor()
+        try:
+            params = router.RouteParams(self.board)
+            unconn = self.unconn if self.status_loaded \
+                else shim.drc_unconnected(bp)
+            prefer = self.layer_choice.GetStringSelection()
+            added, done, failed = 0, [], []
+            for name in names:
+                gaps = unconn.get(name, [])
+                if not gaps:
+                    done.append(name)
+                    continue
+                r = router.route_net(self.board, name, gaps, params, prefer)
+                polys = r.get("polylines")
+                if polys:
+                    added += router.write_polylines(
+                        self.board, r["net_code"], r["layer_id"], polys,
+                        params.width)
+                (done if r.get("ok") else failed).append(name)
+
+            try:
+                pcbnew.ZONE_FILLER(self.board).Fill(self.board.Zones())
+            except Exception:
+                pass
+            try:
+                self.board.BuildConnectivity()
+                pcbnew.Refresh()
+            except Exception:
+                pass
+        finally:
+            wx.EndBusyCursor()
+
+        # routed nets now have copper and no remaining gap — reflect in preview
+        for name in done:
+            self.unconn[name] = []
+            self.status_map[name] = "routed"
+            self.preview._geom_cache.pop(name, None)
+        self.preview.unconn = self.unconn
+        for i, n in enumerate(self.nets):
+            self.net_list.SetString(i, self._net_label(n))
+        self.on_selection(None)
+        self.status.SetLabel(
+            "Routed %d, failed %d, +%d tracks — IN BOARD (unsaved). "
+            "Save to keep, or close w/o saving to discard."
+            % (len(done), len(failed), added))
 
     def on_emit(self, _evt):
         job = shim.build_job(

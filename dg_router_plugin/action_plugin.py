@@ -26,7 +26,11 @@ class DgRouterPlugin(pcbnew.ActionPlugin):
         self.dark_icon_file_name = icon
 
     def Run(self):
-        # Imported lazily so a headless `import pcbnew` of this package never
-        # pulls in wx.
-        from .dialog import show_dialog
-        show_dialog(pcbnew.GetBoard())
+        # Reload submodules so edits take effect on "Refresh Plugins" without a
+        # full KiCad restart (Python otherwise keeps the first import cached).
+        import importlib
+        from . import shim, router, dialog
+        importlib.reload(shim)
+        importlib.reload(router)
+        importlib.reload(dialog)
+        dialog.show_dialog(pcbnew.GetBoard())
