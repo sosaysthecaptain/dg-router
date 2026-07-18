@@ -43,6 +43,19 @@ class RouteParams:
         self.inflate = self.clearance + self.width / 2.0 + self.pitch
 
 
+def _via_width_mm(via, layer):
+    """Via width in mm. The no-arg PCB_VIA.GetWidth() raises SystemError under a
+    running wx.App (i.e. inside KiCad) in KiCad 10 — the layer-arg form works."""
+    for L in (layer, pcbnew.F_Cu, pcbnew.B_Cu):
+        try:
+            w = via.GetWidth(L)
+            if w:
+                return w / _NM
+        except Exception:
+            continue
+    return 0.6
+
+
 def _dominant_width(board, ds):
     """Most common existing track width (matches the board's real netclass),
     falling back to the design minimum."""
@@ -163,7 +176,7 @@ class CostMap:
                 continue
             if t.Type() == pcbnew.PCB_VIA_T:
                 pos = t.GetPosition()
-                r = t.GetWidth() / 2.0 / _NM + clr
+                r = _via_width_mm(t, layer_id) / 2.0 + clr
                 self._stamp_disc(pos.x / _NM, pos.y / _NM, r)
             elif t.IsOnLayer(layer_id):
                 s, e = t.GetStart(), t.GetEnd()

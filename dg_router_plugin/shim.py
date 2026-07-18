@@ -142,6 +142,20 @@ def plot_origin(board, viewbox_w, viewbox_h):
     return (cx - viewbox_w / 2.0, cy - viewbox_h / 2.0)
 
 
+def _via_radius_mm(via):
+    """Via radius in mm. No-arg PCB_VIA.GetWidth() raises under a running wx.App
+    (KiCad GUI) in KiCad 10; the layer-arg form works."""
+    import pcbnew
+    for L in (pcbnew.F_Cu, pcbnew.B_Cu):
+        try:
+            w = via.GetWidth(L)
+            if w:
+                return w / 2.0 / _NM
+        except Exception:
+            continue
+    return 0.3
+
+
 def net_geometry(board, net_names):
     """Per-net copper geometry in mm, for highlight overlays.
 
@@ -174,7 +188,7 @@ def net_geometry(board, net_names):
             continue
         if t.Type() == pcbnew.PCB_VIA_T:
             p = t.GetPosition()
-            out[nm]["vias"].append((p.x / _NM, p.y / _NM, t.GetWidth() / 2.0 / _NM))
+            out[nm]["vias"].append((p.x / _NM, p.y / _NM, _via_radius_mm(t)))
         else:
             s = t.GetStart()
             e = t.GetEnd()
