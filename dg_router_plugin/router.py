@@ -1093,6 +1093,10 @@ def _fine_gap_route(board, net_code, a, b, sl, gl, params, routable,
     ry1 = min(bymax, max(a[1], b[1]) + margin)
     if rx1 - rx0 < fine_pitch or ry1 - ry0 < fine_pitch:
         return None
+    # fine resolution is for LOCAL seals (a boxed pad, a pinched channel). A
+    # huge bbox at 0.05mm is too slow and rarely the seal case — leave it coarse.
+    if rx1 - rx0 > 22.0 and ry1 - ry0 > 22.0:
+        return None
     edge_m = em + width / 2.0 + fine_pitch
     fcm = CostMap(board, routable, net_code, fine_pitch, edge_m, clearance,
                   width, via_dia, region=(rx0, ry0, rx1, ry1),
@@ -1109,7 +1113,8 @@ def _fine_gap_route(board, net_code, a, b, sl, gl, params, routable,
             if fcm.blocked_at(gli, *gc):
                 continue
             cells3 = astar(fcm, [(sc[0], sc[1], sli)], gc, [gli], params,
-                           on_progress=on_progress, should_cancel=should_cancel)
+                           on_progress=on_progress, should_cancel=should_cancel,
+                           max_expansions=120_000)   # fail fast if truly sealed
             if not cells3:
                 continue
             runs, via_cells = split_layer_runs(cells3)
@@ -1193,7 +1198,8 @@ def route_net(board, net_name, gaps, params, prior_segments=None,
                 if not cells3 and use and not (should_cancel and should_cancel()):
                     cells3 = astar(cm, start3, eg_ec, [gli], params,   # widen
                                    on_progress=on_progress,
-                                   should_cancel=should_cancel)
+                                   should_cancel=should_cancel,
+                                   max_expansions=300_000)  # fail fast if sealed
                 if not cells3:
                     continue
                 # stitch: start fanout + coarse path + end fanout (reversed)
