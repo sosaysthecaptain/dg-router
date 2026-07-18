@@ -51,7 +51,19 @@ _STATUS_COL = {"routed": _COL_ROUTED, "partial": _COL_PARTIAL,
                "unrouted": _COL_UNROUTED}
 _STATUS_WORD = {"routed": "routed", "partial": "partial", "unrouted": "unrouted"}
 
+_C_CONN = wx.Colour(120, 245, 255)        # a connection IN the job (bright)
+_C_CONN_OFF = wx.Colour(150, 120, 170)    # shown but not in the job (dim)
+
 _OPEN = []   # keep non-modal dialogs alive
+
+
+def _pt_seg_dist(px, py, gap):
+    x1, y1, x2, y2 = gap
+    vx, vy = x2 - x1, y2 - y1
+    L = vx * vx + vy * vy
+    t = 0.0 if L == 0 else max(0.0, min(1.0, ((px - x1) * vx + (py - y1) * vy) / L))
+    import math
+    return math.hypot(px - (x1 + t * vx), py - (y1 + t * vy))
 
 
 class PreviewPanel(wx.Panel):
@@ -68,7 +80,10 @@ class PreviewPanel(wx.Panel):
         self.status_loaded = False
         self.proposed = []
         self.accepted = []               # committed this session (persist in view)
+        self.conns = []                  # [{id,net,gap}] connections to show
+        self.job_ids = set()             # which connection ids are in the job
         self.on_pad_pick = None          # callback(net_name) on a pad click
+        self.on_conn_toggle = None       # callback(conn) on a ratline click
         self._down = None                # (x,y) at mouse-down, to tell click vs drag
         self.debug_bmp = None            # A* explored heatmap (built by set_explored)
         self.debug_extent = None         # (x0,y0,x1,y1) world mm of the heatmap
@@ -120,6 +135,13 @@ class PreviewPanel(wx.Panel):
         self.Refresh()
         self.Update()   # force an immediate repaint (Refresh alone from a
                         # CallAfter after the route thread didn't always paint)
+
+    def set_connections(self, conns, job_ids):
+        """conns=[{id,net,gap}] to draw as ratlines; job_ids=set of ids that are
+        IN the current job (drawn bright/solid vs dim/dashed for the rest)."""
+        self.conns = conns or []
+        self.job_ids = set(job_ids or [])
+        self.Refresh()
 
     def add_accepted(self, results):
         """Fold just-accepted routes into the view as committed copper so they
@@ -259,26 +281,41 @@ class PreviewPanel(wx.Panel):
         while self.HasCapture():
             self.ReleaseMouse()
         self._drag = None
-        # a click (no meaningful drag) selects the net under the cursor
+        # a click (no meaningful drag) picks a ratline (toggle a connection) or,
+        # failing that, a pad (select its net)
         if self._down is not None:
             dx = evt.GetX() - self._down[0]
             dy = evt.GetY() - self._down[1]
             if dx * dx + dy * dy <= 16:      # <=4px movement == a click
-                self._pick_net_at(evt.GetX(), evt.GetY())
+                self._pick_at(evt.GetX(), evt.GetY())
         self._down = None
 
-    def _pick_net_at(self, mx, my):
-        if self.bg_bmp is None or self.origin is None or not self.on_pad_pick:
-            return
+    def _screen_to_world(self, mx, my):
         ppm = self._ppm()
         bx0, by0 = self._origin_screen(ppm)
         orx, ory = self.origin
-        wx_mm = orx + (mx - bx0) / ppm
-        wy_mm = ory + (my - by0) / ppm
-        name = shim.net_at_point(self.board, wx_mm, wy_mm,
-                                 tol_mm=3.0 / max(ppm, 0.01))
-        if name:
-            self.on_pad_pick(name)
+        return orx + (mx - bx0) / ppm, ory + (my - by0) / ppm, ppm
+
+    def _pick_at(self, mx, my):
+        if self.bg_bmp is None or self.origin is None:
+            return
+        wx_mm, wy_mm, ppm = self._screen_to_world(mx, my)
+        # ratline first: nearest connection segment within ~6px
+        tol = 6.0 / max(ppm, 0.01)
+        best, bd = None, tol
+        for c in self.conns:
+            d = _pt_seg_dist(wx_mm, wy_mm, c["gap"])
+            if d < bd:
+                bd, best = d, c
+        if best is not None and self.on_conn_toggle:
+            self.on_conn_toggle(best)
+            return
+        # else a pad -> select its net
+        if self.on_pad_pick:
+            name = shim.net_at_point(self.board, wx_mm, wy_mm,
+                                     tol_mm=3.0 / max(ppm, 0.01))
+            if name:
+                self.on_pad_pick(name)
 
     def on_motion(self, evt):
         if self._drag and evt.Dragging() and evt.LeftIsDown():
@@ -386,15 +423,19 @@ class PreviewPanel(wx.Panel):
             gc.DrawBitmap(self.debug_bmp, dsx, dsy,
                           (ex1 - ex0) * ppm, (ey1 - ey0) * ppm)
 
+        # connections: bright+solid when in the job, dim+dashed when merely shown
+        for c in self.conns:
+            x1, y1, x2, y2 = c["gap"]
+            in_job = c["id"] in self.job_ids
+            col = _C_CONN if in_job else _C_CONN_OFF
+            glow_line(S(x1, y1), S(x2, y2), col, 3.0 if in_job else 2.0,
+                      not in_job)
+
         for name in self.selected:
             g = self._geom_cache.get(name)
             if not g:
                 continue
             is_active = (name == self.active)
-            rat_col = _C_ACTIVE if is_active else _C_TODO
-            rat_w = 3.0 if is_active else 2.0
-            for (x1, y1, x2, y2) in self._ratsnest_for(name, g):
-                glow_line(S(x1, y1), S(x2, y2), rat_col, rat_w, True)
             for (x1, y1, x2, y2, w) in g["tracks"]:
                 gc.SetPen(wx.Pen(_C_KEPT, max(2, int(round(w * ppm)))))
                 a, b = S(x1, y1), S(x2, y2)
@@ -442,6 +483,7 @@ class RouterDialog(wx.Dialog):
         self.status_map = {}
         self.unconn = {}
         self.proposed = []
+        self.job = {}          # conn_id -> {'id','net','gap'} : the current job
         self._loaded = False
         self._try_seed = 0
 
@@ -509,9 +551,16 @@ class RouterDialog(wx.Dialog):
         self.chk_debug = wx.CheckBox(panel, label="Debug: show A* search heatmap")
         left.Add(self.chk_debug, 0, wx.LEFT | wx.BOTTOM, 8)
 
+        self.job_label = wx.StaticText(panel, label="Job: empty")
+        left.Add(self.job_label, 0, wx.LEFT | wx.RIGHT, 8)
+
+        rrow = wx.BoxSizer(wx.HORIZONTAL)
         self.btn_route = wx.Button(panel, label="Route")
         self.btn_route.SetDefault()
-        left.Add(self.btn_route, 0, wx.EXPAND | wx.ALL, 8)
+        self.btn_trunk = wx.Button(panel, label="Auto-trunk")
+        rrow.Add(self.btn_route, 1, wx.RIGHT, 6)
+        rrow.Add(self.btn_trunk, 0)
+        left.Add(rrow, 0, wx.EXPAND | wx.ALL, 8)
 
         self.act_row = wx.BoxSizer(wx.HORIZONTAL)
         self.btn_commit = wx.Button(panel, label="Accept")
@@ -533,6 +582,7 @@ class RouterDialog(wx.Dialog):
 
         self.preview = PreviewPanel(panel, board)
         self.preview.on_pad_pick = self._on_pad_pick
+        self.preview.on_conn_toggle = self._on_conn_toggle
         main.Add(left, 0, wx.EXPAND)
         main.SetItemMinSize(left, 360, -1)
         main.Add(self.preview, 1, wx.EXPAND | wx.ALL, 6)
@@ -543,6 +593,7 @@ class RouterDialog(wx.Dialog):
         self.SetSizer(droot)
 
         self.btn_route.Bind(wx.EVT_BUTTON, self.on_route)
+        self.btn_trunk.Bind(wx.EVT_BUTTON, self.on_trunk)
         self.btn_try.Bind(wx.EVT_BUTTON, self.on_try_again)
         self.btn_commit.Bind(wx.EVT_BUTTON, self.on_commit)
         self.btn_revert.Bind(wx.EVT_BUTTON, self.on_revert)
@@ -550,8 +601,8 @@ class RouterDialog(wx.Dialog):
         self.btn_none.Bind(wx.EVT_BUTTON, lambda e: self._check_all(False))
         self.btn_claude.Bind(wx.EVT_BUTTON, self.on_driving)
         self.net_list.Bind(wx.EVT_LIST_ITEM_SELECTED, self.on_select)
-        self.net_list.Bind(wx.EVT_LIST_ITEM_CHECKED, self.on_check)
-        self.net_list.Bind(wx.EVT_LIST_ITEM_UNCHECKED, self.on_check)
+        self.net_list.Bind(wx.EVT_LIST_ITEM_CHECKED, self.on_net_checked)
+        self.net_list.Bind(wx.EVT_LIST_ITEM_UNCHECKED, self.on_net_unchecked)
         self.Bind(wx.EVT_CLOSE, self.on_close)
 
         self._show_actions(False)
@@ -567,26 +618,50 @@ class RouterDialog(wx.Dialog):
     def _show_actions(self, show):
         self.act_row.ShowItems(show)
         self.btn_route.Show(not show)
+        self.btn_trunk.Show(not show)
         if show:
             self.btn_commit.SetDefault()      # Accept is the primary action now
         else:
             self.btn_route.SetDefault()
         self.panel.Layout()
 
+    # --- job = a set of connections; net-check and ratline-click both edit it ---
+    def _conns_for_net(self, name):
+        if not self._loaded:
+            return []
+        return shim.net_connections(self.board, name, self.unconn)
+
+    def _add_net(self, name):
+        for c in self._conns_for_net(name):
+            self.job[c["id"]] = {"id": c["id"], "net": name, "gap": c["gap"]}
+
+    def _remove_net(self, name):
+        self.job = {k: v for k, v in self.job.items() if v["net"] != name}
+
     def _on_pad_pick(self, name):
-        """A pad was clicked in the preview: check + select that net."""
+        """Click a pad -> check + select its net (adds all its connections)."""
         for i, n in enumerate(self.nets):
             if n["name"] == name:
                 self.net_list.CheckItem(i, True)
                 self.net_list.Select(i)
                 self.net_list.Focus(i)
                 self.net_list.EnsureVisible(i)
-                self._update_route_enabled()
-                self._refresh_highlight()
+                self._add_net(name)
+                self._refresh_view()
                 return
 
+    def _on_conn_toggle(self, conn):
+        """Click a ratline -> toggle that one connection in the job."""
+        cid = conn["id"]
+        if cid in self.job:
+            del self.job[cid]
+        else:
+            self.job[cid] = {"id": cid, "net": conn["net"], "gap": conn["gap"]}
+        self._refresh_view()
+
     def _update_route_enabled(self):
-        self.btn_route.Enable(self._loaded and bool(self._checked_names()))
+        self.btn_route.Enable(self._loaded and bool(self.job))
+        self.btn_trunk.Enable(self._loaded and self._active_name() is not None)
 
     def _checked_names(self):
         return [self.nets[i]["name"] for i in range(self.net_list.GetItemCount())
@@ -596,25 +671,52 @@ class RouterDialog(wx.Dialog):
         sel = self.net_list.GetFirstSelected()
         return self.nets[sel]["name"] if sel != -1 else None
 
+    def _shown_nets(self):
+        names = set(self._checked_names())
+        a = self._active_name()
+        if a:
+            names.add(a)
+        return sorted(names)
+
     def _check_all(self, on):
         for i in range(self.net_list.GetItemCount()):
             self.net_list.CheckItem(i, on)
-        self._update_route_enabled()
-        self._refresh_highlight()
+        if on:
+            for n in self.nets:
+                self._add_net(n["name"])
+        else:
+            self.job = {}
+        self._refresh_view()
 
-    def on_check(self, _evt):
-        self._update_route_enabled()
-        self._refresh_highlight()
+    def on_net_checked(self, evt):
+        self._add_net(self.nets[evt.GetIndex()]["name"])
+        self._refresh_view()
+
+    def on_net_unchecked(self, evt):
+        self._remove_net(self.nets[evt.GetIndex()]["name"])
+        self._refresh_view()
 
     def on_select(self, _evt):
-        self._refresh_highlight()
+        self._refresh_view()
+
+    def _refresh_view(self):
+        shown = self._shown_nets()
+        self.preview.set_selected(shown, self._active_name())
+        conns = []
+        for nm in shown:
+            for c in self._conns_for_net(nm):
+                conns.append({"id": c["id"], "net": nm, "gap": c["gap"]})
+        self.preview.set_connections(conns, set(self.job.keys()))
+        n = len(self.job)
+        nn = len({v["net"] for v in self.job.values()})
+        self.job_label.SetLabel(
+            "Job: empty" if n == 0 else
+            "Job: %d connection%s on %d net%s"
+            % (n, "" if n == 1 else "s", nn, "" if nn == 1 else "s"))
+        self._update_route_enabled()
 
     def _refresh_highlight(self):
-        active = self._active_name()
-        names = set(self._checked_names())
-        if active:
-            names.add(active)
-        self.preview.set_selected(sorted(names), active)
+        self._refresh_view()
 
     def _apply_status(self):
         for i, n in enumerate(self.nets):
@@ -676,36 +778,26 @@ class RouterDialog(wx.Dialog):
         except Exception:
             pass
 
-    # --- routing (preview-first, ON A THREAD so status/progress stay live) ---
-    def _compute(self, jitter):
-        names = self._checked_names()
-        if not names:
-            wx.MessageBox("Check one or more nets to route first.", "dg-router")
-            return
-        bp = self.board.GetFileName()
-        if not bp or not os.path.exists(bp):
-            wx.MessageBox("Save the board first.", "dg-router")
-            return
+    def _job_unconn(self):
+        """The current job as a {net: [gaps]} subset for route_batch."""
+        sub = {}
+        for v in self.job.values():
+            sub.setdefault(v["net"], []).append(v["gap"])
+        return sub
+
+    def _begin_route(self, label):
+        """Shared setup for a routing worker; returns (bp, debug, dbg, on_prog)."""
         self._shown = []
         self.preview.set_proposed([])
-        self.preview.set_explored(None, None)   # clear any prior heatmap
-        self.status.SetLabel("Routing…")
-        self.gauge.SetRange(max(1, len(names)))
+        self.preview.set_explored(None, None)
+        self.status.SetLabel(label)
         self.gauge.SetValue(0)
         self.gauge.Show()
         self.panel.Layout()
-        # lock interaction while the worker reads the board (avoid concurrent
-        # pcbnew access + double-route)
         self.btn_route.Disable()
+        self.btn_trunk.Disable()
         self.net_list.Disable()
-
-        params = self._params(jitter=jitter)
-        cached = self.unconn
         debug = self.chk_debug.GetValue()
-
-        def on_net(done, total, result):
-            wx.CallAfter(self._route_net_ui, done, total, result)
-
         dbg = {"cells": set(), "grid": None}
 
         def on_prog(cm, new_cells):
@@ -713,15 +805,59 @@ class RouterDialog(wx.Dialog):
                 dbg["grid"] = (cm.nx, cm.ny, cm.x0, cm.y0, cm.pitch)
             for (i, j, _cl) in new_cells:
                 dbg["cells"].add((i, j))
+        return debug, dbg, on_prog
+
+    # --- routing (preview-first, ON A THREAD so status/progress stay live) ---
+    def _compute(self, jitter):
+        sub = self._job_unconn()
+        if not sub:
+            wx.MessageBox("Build a job first: check nets or click ratlines.",
+                          "dg-router")
+            return
+        bp = self.board.GetFileName()
+        if not bp or not os.path.exists(bp):
+            wx.MessageBox("Save the board first.", "dg-router")
+            return
+        names = list(sub.keys())
+        debug, dbg, on_prog = self._begin_route("Routing…")
+        self.gauge.SetRange(max(1, len(names)))
+        params = self._params(jitter=jitter)
+
+        def on_net(done, total, result):
+            wx.CallAfter(self._route_net_ui, done, total, result)
 
         def worker():
             try:
-                unconn = cached or shim.drc_unconnected(bp)
                 results = router.route_batch(
-                    self.board, names, unconn, params, on_net=on_net,
+                    self.board, names, sub, params, on_net=on_net,
                     on_progress=(on_prog if debug else None))
                 wx.CallAfter(self._route_done, results,
                              dbg if debug else None)
+            except Exception as e:  # noqa: BLE001
+                wx.CallAfter(self._route_error,
+                             "%s\n\n%s" % (e, traceback.format_exc()))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def on_trunk(self, _evt):
+        name = self._active_name()
+        if not name:
+            wx.MessageBox("Select a net (click its row or a pad) to auto-trunk.",
+                          "dg-router")
+            return
+        bp = self.board.GetFileName()
+        if not bp or not os.path.exists(bp):
+            wx.MessageBox("Save the board first.", "dg-router")
+            return
+        debug, dbg, on_prog = self._begin_route("Auto-trunking %s…" % name)
+        self.gauge.SetRange(1)
+        params = self._params()
+
+        def worker():
+            try:
+                r = router.auto_trunk(self.board, name, params,
+                                      on_progress=(on_prog if debug else None))
+                wx.CallAfter(self._route_done, [r], dbg if debug else None)
             except Exception as e:  # noqa: BLE001
                 wx.CallAfter(self._route_error,
                              "%s\n\n%s" % (e, traceback.format_exc()))
@@ -762,10 +898,10 @@ class RouterDialog(wx.Dialog):
         self.gauge.Hide()
         self.panel.Layout()
         self.net_list.Enable()
+        self._update_route_enabled()
 
     def _route_error(self, text):
         self._finish_route()
-        self.btn_route.Enable()
         self.status.SetLabel("Routing error — see details")
         self._text_dialog("Routing error", text)
 
@@ -823,34 +959,37 @@ class RouterDialog(wx.Dialog):
 
     def on_commit(self, _evt):
         added = 0
-        done = []
         committed = []
         for r in self.proposed:
             if r.get("segments") or r.get("vias"):
                 added += len(router.write_result(self.board, r["net_code"], r))
                 committed.append(r)
-            done.append(r["net"])
         router.refill_zones(self.board)
         self._refresh_canvas()
-        for name in done:
-            self.status_map[name] = "routed"
-            self.unconn[name] = []
-        self._apply_status()
         self.proposed = []
         self.preview.add_accepted(committed)   # keep them visible next pass (h)
         self.preview.set_proposed([])
-        self.preview.set_routing(self.unconn)
-        self.status.SetLabel("Accepted %d items (Cmd+S to save). Route again."
-                             % added)
         self._reset_pass()
+        # Re-derive status/ratsnest so partial-net jobs are accurate. DRC reads a
+        # file, but we must NOT touch the user's .kicad_pcb — save a TEMP copy and
+        # DRC that. (He still saves his own board with Cmd+S.)
+        self.status.SetLabel("Accepted %d items (Cmd+S to save) — refreshing…"
+                             % added)
+        tmp = os.path.join(tempfile.gettempdir(), "dg-accept-drc.kicad_pcb")
+        try:
+            pcbnew.SaveBoard(tmp, self.board)
+            threading.Thread(target=self._status_worker, args=(tmp,),
+                             daemon=True).start()
+        except Exception:
+            pass
 
     def _reset_pass(self):
         for i in range(self.net_list.GetItemCount()):
             if self.net_list.IsItemChecked(i):
                 self.net_list.CheckItem(i, False)
-        self._refresh_highlight()
+        self.job = {}
+        self._refresh_view()
         self._show_actions(False)
-        self._update_route_enabled()
 
     def _text_dialog(self, title, text, size=(720, 640)):
         """A read-only, COPYABLE text window (errors, agent instructions)."""

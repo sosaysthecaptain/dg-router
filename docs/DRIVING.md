@@ -31,6 +31,19 @@ Route (writes a COPY, never the open board):
         --route-via-cost 10
     # -> writes <board dir>/dg-router-out/routed.kicad_pcb
     #    reports unconnected before -> after; then --render-png it to review
+    #    (also copies the board's .kicad_pro so DRC uses its REAL netclass rules)
+
+A job = a set of connections. Break a fat net into smaller jobs by naming the
+specific pad-pairs to route (same atom the GUI's ratline-click builds):
+
+    $KPY headless.py "$BOARD" --list-connections /+12V
+    # -> lists addressable connections: U5.1:C12.2   4.20 mm  ...
+    $KPY headless.py "$BOARD" --connect U5.1:C12.2 U5.1:C13.2
+    # -> routes ONLY those connections; writes routed.kicad_pcb
+
+Power/multi-pin nets — trunk (MST spine) + branches to nearest trunk copper:
+
+    $KPY headless.py "$BOARD" --auto-trunk /+12V --layers F.Cu,B.Cu
 
 Options:
 - `--layers F.Cu,B.Cu` — routable copper layers.
