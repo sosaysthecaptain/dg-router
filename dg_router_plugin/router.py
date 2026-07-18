@@ -110,13 +110,23 @@ class RouteParams:
 
 class CostMap:
     def __init__(self, board, layer_ids, net_code, pitch, edge_margin,
-                 clearance, width, via_dia):
-        bb = board.GetBoardEdgesBoundingBox()
-        self.x0 = bb.GetX() / _NM
-        self.y0 = bb.GetY() / _NM
+                 clearance, width, via_dia, region=None, clear_own=False,
+                 stamp_edges=True):
+        # region=(x0,y0,x1,y1) mm restricts the grid to a sub-window (used for
+        # fine-resolution fallback routing of a single hard connection). When
+        # region is set the caller has already clipped it inside the board edge,
+        # so stamp_edges is off and clear_own opens our own pads for entry.
+        if region is None:
+            bb = board.GetBoardEdgesBoundingBox()
+            self.x0 = bb.GetX() / _NM
+            self.y0 = bb.GetY() / _NM
+            w_mm, h_mm = bb.GetWidth() / _NM, bb.GetHeight() / _NM
+        else:
+            self.x0, self.y0, rx1, ry1 = region
+            w_mm, h_mm = rx1 - self.x0, ry1 - self.y0
         self.pitch = pitch
-        self.nx = max(1, int(math.ceil(bb.GetWidth() / _NM / pitch)))
-        self.ny = max(1, int(math.ceil(bb.GetHeight() / _NM / pitch)))
+        self.nx = max(1, int(math.ceil(w_mm / pitch)))
+        self.ny = max(1, int(math.ceil(h_mm / pitch)))
         self.layers = list(layer_ids)
         n = self.nx * self.ny
         self.blocked = [bytearray(n) for _ in self.layers]
@@ -131,10 +141,33 @@ class CostMap:
         self.via_inflate = clearance + via_dia / 2.0 + pitch
 
         edge_via = edge_margin + (via_dia - width) / 2.0
-        for li in range(len(self.layers)):
-            self._stamp_edge(self.blocked[li], edge_margin)
-        self._stamp_edge(self.via_blocked, edge_via)
+        if stamp_edges:
+            for li in range(len(self.layers)):
+                self._stamp_edge(self.blocked[li], edge_margin)
+            self._stamp_edge(self.via_blocked, edge_via)
         self._stamp_obstacles(board, net_code)
+        if clear_own:
+            self._clear_own_pads(board, net_code)
+
+    def _clear_own_pads(self, board, net_code):
+        """Open our own pads (copper we may land on) so a fine pad-to-pad route
+        starts/ends free — no separate escape phase needed."""
+        lidx = {L: k for k, L in enumerate(self.layers)}
+        x1 = self.x0 + self.nx * self.pitch
+        y1 = self.y0 + self.ny * self.pitch
+        for pad in board.GetPads():
+            if pad.GetNetCode() != net_code:
+                continue
+            p = pad.GetPosition()
+            px, py = p.x / _NM, p.y / _NM
+            if not (self.x0 - 1 <= px <= x1 + 1 and self.y0 - 1 <= py <= y1 + 1):
+                continue
+            sz = pad.GetSize()
+            ang = _safe(lambda: pad.GetOrientation().AsRadians(), 0.0)
+            for L in self.layers:
+                if pad.IsOnLayer(L):
+                    self._rect(self.blocked[lidx[L]], px, py,
+                               sz.x / 2.0 / _NM, sz.y / 2.0 / _NM, ang, 0)
 
     def idx(self, i, j):
         return j * self.nx + i
@@ -1040,6 +1073,59 @@ def _corridor_bounds(cm, a_cell, b_cell):
             min(a_cell[1], b_cell[1]) - m, max(a_cell[1], b_cell[1]) + m)
 
 
+def _fine_gap_route(board, net_code, a, b, sl, gl, params, routable,
+                    width, clearance, via_dia, via_drill, neck_a, neck_b,
+                    prior_segments, prior_vias, on_progress=None,
+                    should_cancel=None):
+    """Route one hard connection at FINE (0.05mm) resolution over just its
+    bounding box — threads narrow channels the coarse grid seals. Own pads are
+    opened so it routes pad-center to pad-center directly (no escape hand-off).
+    Returns {segments, vias, cells} or None."""
+    fine_pitch = 0.05
+    bx = board.GetBoardEdgesBoundingBox()
+    em = params.edge_clearance
+    bxmin, bymin = bx.GetX() / _NM + em, bx.GetY() / _NM + em
+    bxmax, bymax = bx.GetRight() / _NM - em, bx.GetBottom() / _NM - em
+    margin = 4.0
+    rx0 = max(bxmin, min(a[0], b[0]) - margin)
+    ry0 = max(bymin, min(a[1], b[1]) - margin)
+    rx1 = min(bxmax, max(a[0], b[0]) + margin)
+    ry1 = min(bymax, max(a[1], b[1]) + margin)
+    if rx1 - rx0 < fine_pitch or ry1 - ry0 < fine_pitch:
+        return None
+    edge_m = em + width / 2.0 + fine_pitch
+    fcm = CostMap(board, routable, net_code, fine_pitch, edge_m, clearance,
+                  width, via_dia, region=(rx0, ry0, rx1, ry1),
+                  clear_own=True, stamp_edges=False)
+    if prior_segments or prior_vias:
+        fcm.stamp_prior(prior_segments or [], prior_vias or [], width)
+    sc, gc = fcm.to_cell(*a), fcm.to_cell(*b)
+    if not (fcm.in_bounds(*sc) and fcm.in_bounds(*gc)):
+        return None
+    for sli in sl:
+        if fcm.blocked_at(sli, *sc):
+            continue
+        for gli in gl:
+            if fcm.blocked_at(gli, *gc):
+                continue
+            cells3 = astar(fcm, [(sc[0], sc[1], sli)], gc, [gli], params,
+                           on_progress=on_progress, should_cancel=should_cancel)
+            if not cells3:
+                continue
+            runs, via_cells = split_layer_runs(cells3)
+            segs, cells_by = [], {}
+            for ri, (li, run) in enumerate(runs):
+                cpoly = _octi_cleanup(fcm, li, octi_pull(fcm, li, run))
+                ns = neck_a if ri == 0 else width
+                ne = neck_b if ri == len(runs) - 1 else width
+                segs += build_segments(cpoly, routable[li], width, ns, ne)
+                cells_by.setdefault(li, []).extend(run)
+            vias = [(fcm.to_world(vi, vj)[0], fcm.to_world(vi, vj)[1],
+                     via_dia, via_drill) for (vi, vj) in via_cells]
+            return {"segments": segs, "vias": vias, "cells": cells_by}
+    return None
+
+
 def route_net(board, net_name, gaps, params, prior_segments=None,
               prior_vias=None, attract_paths=None, on_progress=None,
               avoid_points=None, should_cancel=None):
@@ -1139,6 +1225,25 @@ def route_net(board, net_name, gaps, params, prior_segments=None,
                 break
             if gap_ok:
                 break
+
+        if not gap_ok and not (should_cancel and should_cancel()):
+            # coarse grid sealed this connection — retry it at fine resolution
+            # over just its bounding box (threads narrow channels)
+            fb = _fine_gap_route(board, net_code, (x1, y1), (x2, y2), sl, gl,
+                                 params, routable, width, clearance, via_dia,
+                                 via_drill, neck_s, neck_e,
+                                 prior_segments, prior_vias,
+                                 on_progress=on_progress, should_cancel=should_cancel)
+            if fb:
+                segments += fb["segments"]
+                for li, cells in fb["cells"].items():
+                    path_cells_by_layer.setdefault(li, []).extend(cells)
+                for (vx, vy, vd, vdr) in fb["vias"]:
+                    vias.append((vx, vy, vd, vdr))
+                    for li in range(len(cm.layers)):
+                        cm._disc(cm.blocked[li], vx, vy, vd / 2.0 + cm.track_inflate)
+                    cm._disc(cm.via_blocked, vx, vy, vd / 2.0 + cm.via_inflate)
+                routed += 1
 
     return {"net": net_name, "ok": routed == len(gaps) and len(gaps) > 0,
             "gaps": len(gaps), "routed": routed, "segments": segments,
