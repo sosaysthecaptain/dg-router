@@ -35,7 +35,9 @@ _C_PROP = {pcbnew.F_Cu: wx.Colour(0, 229, 255),
 _C_PROP_DEFAULT = wx.Colour(230, 230, 230)
 _C_PROP_VIA = wx.Colour(255, 235, 59)
 _BG = wx.Colour(24, 24, 24)
-_BG_PPM = 24.0                            # full-res render (px per mm)
+_C_EDGE = wx.Colour(210, 210, 70)         # board outline (KiCad edge-cuts yellow)
+_BG_PPM = 30.0                            # base render resolution (px per mm)
+_BG_PPM_MAX = 110.0                       # cap for re-raster on zoom-in
 
 # net-list status (word column stays readable under the blue selection)
 _COL_ROUTED = wx.Colour(30, 160, 70)
@@ -66,6 +68,9 @@ class PreviewPanel(wx.Panel):
         self.zoom = 1.0
         self.panx = self.pany = 0.0
         self._drag = None
+        self._svg = None
+        self._bmp_ppm = _BG_PPM          # actual resolution of bg_bmp
+        self._pinch_base = 1.0
         self.SetBackgroundStyle(wx.BG_STYLE_PAINT)
         self.SetBackgroundColour(_BG)
         self.Bind(wx.EVT_PAINT, self.on_paint)
@@ -75,6 +80,16 @@ class PreviewPanel(wx.Panel):
         self.Bind(wx.EVT_LEFT_UP, self.on_up)
         self.Bind(wx.EVT_MOTION, self.on_motion)
         self.Bind(wx.EVT_SIZE, lambda e: (self.Refresh(), e.Skip()))
+        # re-raster from the SVG at the zoom level (crisp like Mac Preview),
+        # debounced so it happens after the gesture settles.
+        self._rtimer = wx.Timer(self)
+        self.Bind(wx.EVT_TIMER, self._on_rtimer)
+        # pinch-to-zoom (trackpad); two-finger scroll pans (see on_wheel)
+        try:
+            self.EnableTouchEvents(wx.TOUCH_ZOOM_GESTURE)
+            self.Bind(wx.EVT_GESTURE_ZOOM, self.on_pinch)
+        except Exception:
+            pass
 
     # --- state ---
     def set_selected(self, names, active=None):
@@ -115,21 +130,67 @@ class PreviewPanel(wx.Panel):
         return ((cw - self.vbw * ppm) / 2.0 + self.panx,
                 (ch - self.vbh * ppm) / 2.0 + self.pany)
 
-    def on_wheel(self, evt):
+    def _zoom_at(self, factor, mx, my):
         if self.bg_bmp is None:
             return
-        mx, my = evt.GetX(), evt.GetY()
         ppm = self._ppm()
         bx0, by0 = self._origin_screen(ppm)
         wxmm = self.origin[0] + (mx - bx0) / ppm
         wymm = self.origin[1] + (my - by0) / ppm
-        f = 1.2 if evt.GetWheelRotation() > 0 else 1 / 1.2
-        self.zoom = min(80.0, max(0.3, self.zoom * f))
+        self.zoom = min(80.0, max(0.3, self.zoom * factor))
         ppm2 = self._ppm()
         cw, ch = self.GetClientSize()
         self.panx = mx - (wxmm - self.origin[0]) * ppm2 - (cw - self.vbw * ppm2) / 2.0
         self.pany = my - (wymm - self.origin[1]) * ppm2 - (ch - self.vbh * ppm2) / 2.0
         self.Refresh()
+        self._rtimer.StartOnce(140)
+
+    def on_wheel(self, evt):
+        if self.bg_bmp is None:
+            return
+        d = evt.GetWheelRotation()
+        if evt.ControlDown() or evt.CmdDown():   # modifier + scroll = zoom
+            self._zoom_at(1.2 if d > 0 else 1 / 1.2, evt.GetX(), evt.GetY())
+            return
+        # two-finger / wheel scroll = PAN (KiCad convention)
+        if evt.GetWheelAxis() == wx.MOUSE_WHEEL_HORIZONTAL:
+            self.panx -= d
+        else:
+            self.pany += d
+        self.Refresh()
+
+    def on_pinch(self, evt):
+        if self.bg_bmp is None:
+            return
+        try:
+            if evt.IsGestureStart():
+                self._pinch_base = self.zoom
+            pos = evt.GetPosition()
+            target = max(0.3, min(80.0, self._pinch_base * evt.GetZoomFactor()))
+            self._zoom_at(target / self.zoom if self.zoom else 1.0, pos.x, pos.y)
+        except Exception:
+            pass
+
+    def _on_rtimer(self, _evt):
+        """After a zoom settles, re-raster from the SVG so it's crisp (not a
+        blurry upscaled bitmap) — and drop back to base res when zoomed out."""
+        if self.bg_bmp is None or not self._svg:
+            return
+        target = self._ppm()
+        if target > self._bmp_ppm * 1.25 and self._bmp_ppm < _BG_PPM_MAX:
+            self._reraster(min(target, _BG_PPM_MAX))
+        elif target < self._bmp_ppm * 0.5 and self._bmp_ppm > _BG_PPM:
+            self._reraster(_BG_PPM)
+
+    def _reraster(self, ppm):
+        try:
+            img = wx.svg.SVGimage.CreateFromFile(self._svg)
+            self.bg_bmp = img.ConvertToScaledBitmap(
+                wx.Size(max(1, int(self.vbw * ppm)), max(1, int(self.vbh * ppm))))
+            self._bmp_ppm = ppm
+            self.Refresh()
+        except Exception:
+            pass
 
     def on_down(self, evt):
         self._drag = (evt.GetX(), evt.GetY(), self.panx, self.pany)
@@ -158,8 +219,10 @@ class PreviewPanel(wx.Panel):
         try:
             svg = os.path.join(tempfile.gettempdir(), "dg-router-preview.svg")
             shim.render_board_svg(bp, svg)
+            self._svg = svg
             self.vbw, self.vbh = shim.parse_svg_viewbox(svg)
             self.origin = shim.plot_origin(self.board, self.vbw, self.vbh)
+            self._bmp_ppm = _BG_PPM
             wpx = max(1, int(self.vbw * _BG_PPM))
             hpx = max(1, int(self.vbh * _BG_PPM))
             img = wx.svg.SVGimage.CreateFromFile(svg)
@@ -191,21 +254,30 @@ class PreviewPanel(wx.Panel):
         bx0, by0 = self._origin_screen(ppm)
         orx, ory = self.origin
         bgW, bgH = self.bg_bmp.GetWidth(), self.bg_bmp.GetHeight()
-        k = _BG_PPM / ppm
+        k = self._bmp_ppm / ppm          # bg-bitmap px per screen px
+
+        gc = wx.GraphicsContext.Create(dc)
+        try:
+            gc.SetInterpolationQuality(wx.INTERPOLATION_BEST)
+        except Exception:
+            pass
 
         sx0 = max(0, int((0 - bx0) * k))
         sy0 = max(0, int((0 - by0) * k))
         sx1 = min(bgW, int((cw - bx0) * k) + 2)
         sy1 = min(bgH, int((ch - by0) * k) + 2)
-        gc = wx.GraphicsContext.Create(dc)
         if sx1 > sx0 and sy1 > sy0:
             rect = wx.Rect(sx0, sy0, sx1 - sx0, sy1 - sy0)
-            dw = max(1, int((sx1 - sx0) / k))
-            dh = max(1, int((sy1 - sy0) / k))
-            dx, dy = int(bx0 + sx0 / k), int(by0 + sy0 / k)
-            sub = self.bg_bmp.GetSubBitmap(rect).ConvertToImage().Scale(
-                dw, dh, wx.IMAGE_QUALITY_NORMAL).ConvertToBitmap()
-            dc.DrawBitmap(sub, dx, dy)
+            dw = max(1, (sx1 - sx0) / k)
+            dh = max(1, (sy1 - sy0) / k)
+            dx, dy = bx0 + sx0 / k, by0 + sy0 / k
+            # let Core Graphics scale the visible sub-bitmap (smooth + crisp)
+            gc.DrawBitmap(self.bg_bmp.GetSubBitmap(rect), dx, dy, dw, dh)
+
+        # board outline (edge cuts can render at the very border / clipped)
+        gc.SetBrush(wx.Brush(wx.Colour(0, 0, 0, 0)))
+        gc.SetPen(wx.Pen(_C_EDGE, 1.2))
+        gc.DrawRectangle(bx0, by0, self.vbw * ppm, self.vbh * ppm)
 
         def S(x, y):
             return (bx0 + (x - orx) * ppm, by0 + (y - ory) * ppm)
