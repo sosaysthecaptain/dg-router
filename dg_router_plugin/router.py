@@ -16,6 +16,7 @@ kicad-cli DRC is the ground-truth check (connectivity + violations).
 
 import math
 import heapq
+import random
 
 import pcbnew
 
@@ -61,11 +62,15 @@ def _via_width_mm(via, layer):
 
 class RouteParams:
     def __init__(self, board, pitch_mm=0.2, turn_cost=0.7, via_cost=25.0,
-                 layer_names=None):
+                 layer_names=None, seed=0, jitter=0.0):
         ds = board.GetDesignSettings()
         self.pitch = pitch_mm
         self.turn_cost = turn_cost
         self.via_cost = via_cost           # extra A* cost (grid steps) per via
+        # "Try again" perturbs costs so a deterministic A* yields a different
+        # valid solution. jitter=0 -> deterministic.
+        self.jitter = jitter
+        self._rng = random.Random(seed)
         self.edge_clearance = _safe(lambda: ds.m_CopperEdgeClearance / _NM, 0.3)
         self.min_track = _safe(lambda: ds.m_TrackMinWidth / _NM, 0.2)
         self.layer_names = layer_names or list(DEFAULT_LAYERS)
@@ -299,6 +304,8 @@ def astar(cm, starts, goal_cell, goal_layers, params, max_expansions=1_500_000):
             cost = step + turn * params.turn_cost
             if cm.attract[cl][cm.idx(ni, nj)]:
                 cost = max(0.1, cost - attract_bonus)
+            if params.jitter:
+                cost += params.jitter * params._rng.random()
             ng = gc + cost
             nst = (ni, nj, nd)
             key = (ni, nj, cl, nd)
