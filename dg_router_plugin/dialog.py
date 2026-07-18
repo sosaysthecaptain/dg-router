@@ -111,6 +111,8 @@ class PreviewPanel(wx.Panel):
     def set_proposed(self, results):
         self.proposed = results or []
         self.Refresh()
+        self.Update()   # force an immediate repaint (Refresh alone from a
+                        # CallAfter after the route thread didn't always paint)
 
     def _ratsnest_for(self, name, geom):
         if self.status_loaded:
