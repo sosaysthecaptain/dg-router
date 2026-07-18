@@ -42,7 +42,8 @@ class RouterDialog(wx.Dialog):
         super().__init__(None, title="dg-router", size=(380, 700),
                          style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER)
         self.board = board
-        self.nets = shim.list_nets(board)
+        # 1-pad nets can't be routed — don't clutter the list with them
+        self.nets = [n for n in shim.list_nets(board) if n["pads"] >= 2]
         self.layers = shim.copper_layer_names(board)
         self.status_map = {}
         self.unconn = {}
