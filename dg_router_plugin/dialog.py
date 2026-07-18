@@ -1,25 +1,43 @@
-"""wx dialog for dg-router — CONTROLS ONLY. Preview happens in KiCad's canvas.
+"""wx dialog for dg-router — controls + a fluid full-res board preview.
 
-No in-dialog board render. Route draws the proposed traces straight into the
-open board so you review them in KiCad's real editor (native zoom/pan/layers).
-The window is non-modal so KiCad stays interactive. Commit keeps the traces
-(you Save), Revert removes them, Try again re-routes differently.
+The preview is the working surface: a full-resolution board render, cached once
+and zoomed/panned within (never regenerated), with overlays drawn ON TOP (never
+on the board itself):
+- selected/checked nets' ratlines (checked bright, the active one brighter),
+- proposed routes after Route (preview-first: the board is not touched until
+  Accept),
+- (later) live routing playback.
 
-Net rows are colored by routing status — green routed / amber partial / grey
-unrouted (no emoji, no icons).
+Accept applies the proposed routes to the board; Reject discards them (the board
+was never modified); Try again re-routes differently. Non-modal so KiCad stays
+interactive.
 """
 
 import os
+import tempfile
 import threading
 import traceback
 
 import pcbnew
 import wx
+import wx.svg
 
 from . import shim
 from . import router
 
-# net-row status colors (readable on the white list background)
+# overlay colors
+_C_PAD = wx.Colour(255, 235, 59)
+_C_KEPT = wx.Colour(75, 222, 128)         # existing same-net copper
+_C_TODO = wx.Colour(255, 62, 165)         # ratlines of a checked net (magenta)
+_C_ACTIVE = wx.Colour(120, 245, 255)      # ratlines of the ACTIVE net (brighter)
+_C_PROP = {pcbnew.F_Cu: wx.Colour(0, 229, 255),
+           pcbnew.B_Cu: wx.Colour(255, 150, 0)}
+_C_PROP_DEFAULT = wx.Colour(230, 230, 230)
+_C_PROP_VIA = wx.Colour(255, 235, 59)
+_BG = wx.Colour(24, 24, 24)
+_BG_PPM = 24.0                            # full-res render (px per mm)
+
+# net-list status (word column stays readable under the blue selection)
 _COL_ROUTED = wx.Colour(30, 160, 70)
 _COL_PARTIAL = wx.Colour(200, 130, 0)
 _COL_UNROUTED = wx.Colour(140, 140, 140)
@@ -28,54 +46,242 @@ _STATUS_COL = {"routed": _COL_ROUTED, "partial": _COL_PARTIAL,
                "unrouted": _COL_UNROUTED}
 _STATUS_WORD = {"routed": "routed", "partial": "partial", "unrouted": "unrouted"}
 
-# native KiCad net colors for highlighting (no board geometry -> nothing left
-# behind). checked nets get a bright color, the active net an even brighter one.
-_HL_CHECKED = (0.10, 0.85, 1.00)   # bright cyan
-_HL_ACTIVE = (1.00, 0.95, 0.25)    # bright yellow
+_OPEN = []   # keep non-modal dialogs alive
 
-# keep non-modal dialogs alive (prevent GC after Run() returns)
-_OPEN = []
+
+class PreviewPanel(wx.Panel):
+    def __init__(self, parent, board):
+        super().__init__(parent, style=wx.BORDER_SIMPLE)
+        self.board = board
+        self.bg_bmp = None
+        self.origin = None
+        self.vbw = self.vbh = 1.0
+        self.err = None
+        self.selected = []
+        self.active = None
+        self.unconn = {}
+        self.status_loaded = False
+        self.proposed = []
+        self._geom_cache = {}
+        self.zoom = 1.0
+        self.panx = self.pany = 0.0
+        self._drag = None
+        self.SetBackgroundStyle(wx.BG_STYLE_PAINT)
+        self.SetBackgroundColour(_BG)
+        self.Bind(wx.EVT_PAINT, self.on_paint)
+        self.Bind(wx.EVT_ERASE_BACKGROUND, lambda e: None)
+        self.Bind(wx.EVT_MOUSEWHEEL, self.on_wheel)
+        self.Bind(wx.EVT_LEFT_DOWN, self.on_down)
+        self.Bind(wx.EVT_LEFT_UP, self.on_up)
+        self.Bind(wx.EVT_MOTION, self.on_motion)
+        self.Bind(wx.EVT_SIZE, lambda e: (self.Refresh(), e.Skip()))
+
+    # --- state ---
+    def set_selected(self, names, active=None):
+        self.selected = list(names)
+        self.active = active
+        for name in names:
+            if name not in self._geom_cache:
+                self._geom_cache[name] = \
+                    shim.net_geometry(self.board, [name]).get(name)
+        self.Refresh()
+
+    def set_routing(self, unconn):
+        self.unconn = unconn or {}
+        self.status_loaded = True
+        self.Refresh()
+
+    def set_proposed(self, results):
+        self.proposed = results or []
+        self.Refresh()
+
+    def _ratsnest_for(self, name, geom):
+        if self.status_loaded:
+            return self.unconn.get(name, [])
+        pts = [(p[0], p[1]) for p in geom["pads"]]
+        return [(pts[i][0], pts[i][1], pts[j][0], pts[j][1])
+                for i, j in shim.mst_edges(pts)]
+
+    # --- view transform ---
+    def _fit_ppm(self):
+        cw, ch = self.GetClientSize()
+        return max(0.01, min((cw - 16) / self.vbw, (ch - 16) / self.vbh))
+
+    def _ppm(self):
+        return self._fit_ppm() * self.zoom
+
+    def _origin_screen(self, ppm):
+        cw, ch = self.GetClientSize()
+        return ((cw - self.vbw * ppm) / 2.0 + self.panx,
+                (ch - self.vbh * ppm) / 2.0 + self.pany)
+
+    def on_wheel(self, evt):
+        if self.bg_bmp is None:
+            return
+        mx, my = evt.GetX(), evt.GetY()
+        ppm = self._ppm()
+        bx0, by0 = self._origin_screen(ppm)
+        wxmm = self.origin[0] + (mx - bx0) / ppm
+        wymm = self.origin[1] + (my - by0) / ppm
+        f = 1.2 if evt.GetWheelRotation() > 0 else 1 / 1.2
+        self.zoom = min(80.0, max(0.3, self.zoom * f))
+        ppm2 = self._ppm()
+        cw, ch = self.GetClientSize()
+        self.panx = mx - (wxmm - self.origin[0]) * ppm2 - (cw - self.vbw * ppm2) / 2.0
+        self.pany = my - (wymm - self.origin[1]) * ppm2 - (ch - self.vbh * ppm2) / 2.0
+        self.Refresh()
+
+    def on_down(self, evt):
+        self._drag = (evt.GetX(), evt.GetY(), self.panx, self.pany)
+        self.CaptureMouse()
+
+    def on_up(self, _evt):
+        if self.HasCapture():
+            self.ReleaseMouse()
+        self._drag = None
+
+    def on_motion(self, evt):
+        if self._drag and evt.Dragging() and evt.LeftIsDown():
+            x0, y0, px, py = self._drag
+            self.panx = px + (evt.GetX() - x0)
+            self.pany = py + (evt.GetY() - y0)
+            self.Refresh()
+
+    # --- rendering ---
+    def _ensure_background(self):
+        if self.bg_bmp is not None or self.err is not None:
+            return
+        bp = self.board.GetFileName()
+        if not bp or not os.path.exists(bp):
+            self.err = "Save the board to enable the preview."
+            return
+        try:
+            svg = os.path.join(tempfile.gettempdir(), "dg-router-preview.svg")
+            shim.render_board_svg(bp, svg)
+            self.vbw, self.vbh = shim.parse_svg_viewbox(svg)
+            self.origin = shim.plot_origin(self.board, self.vbw, self.vbh)
+            wpx = max(1, int(self.vbw * _BG_PPM))
+            hpx = max(1, int(self.vbh * _BG_PPM))
+            img = wx.svg.SVGimage.CreateFromFile(svg)
+            self.bg_bmp = img.ConvertToScaledBitmap(wx.Size(wpx, hpx))
+        except Exception as e:  # noqa: BLE001
+            self.err = "Preview failed:\n%s" % e
+
+    def _center_text(self, dc, text):
+        dc.SetTextForeground(wx.Colour(180, 180, 180))
+        cs = self.GetClientSize()
+        for i, line in enumerate(text.split("\n")):
+            w, h = dc.GetTextExtent(line)
+            dc.DrawText(line, (cs.width - w) // 2, cs.height // 2 + i * (h + 2) - 20)
+
+    def on_paint(self, _evt):
+        dc = wx.AutoBufferedPaintDC(self)
+        dc.SetBackground(wx.Brush(_BG))
+        dc.Clear()
+        self._ensure_background()
+        if self.err:
+            self._center_text(dc, self.err)
+            return
+        if self.bg_bmp is None:
+            self._center_text(dc, "Rendering board…")
+            return
+
+        cw, ch = self.GetClientSize()
+        ppm = self._ppm()
+        bx0, by0 = self._origin_screen(ppm)
+        orx, ory = self.origin
+        bgW, bgH = self.bg_bmp.GetWidth(), self.bg_bmp.GetHeight()
+        k = _BG_PPM / ppm
+
+        sx0 = max(0, int((0 - bx0) * k))
+        sy0 = max(0, int((0 - by0) * k))
+        sx1 = min(bgW, int((cw - bx0) * k) + 2)
+        sy1 = min(bgH, int((ch - by0) * k) + 2)
+        gc = wx.GraphicsContext.Create(dc)
+        if sx1 > sx0 and sy1 > sy0:
+            rect = wx.Rect(sx0, sy0, sx1 - sx0, sy1 - sy0)
+            dw = max(1, int((sx1 - sx0) / k))
+            dh = max(1, int((sy1 - sy0) / k))
+            dx, dy = int(bx0 + sx0 / k), int(by0 + sy0 / k)
+            sub = self.bg_bmp.GetSubBitmap(rect).ConvertToImage().Scale(
+                dw, dh, wx.IMAGE_QUALITY_NORMAL).ConvertToBitmap()
+            dc.DrawBitmap(sub, dx, dy)
+
+        def S(x, y):
+            return (bx0 + (x - orx) * ppm, by0 + (y - ory) * ppm)
+
+        for name in self.selected:
+            g = self._geom_cache.get(name)
+            if not g:
+                continue
+            is_active = (name == self.active)
+            rat_col = _C_ACTIVE if is_active else _C_TODO
+            rat_w = 2.5 if is_active else 1.5
+            gc.SetPen(wx.Pen(rat_col, rat_w, wx.PENSTYLE_SHORT_DASH))
+            for (x1, y1, x2, y2) in self._ratsnest_for(name, g):
+                a, b = S(x1, y1), S(x2, y2)
+                gc.StrokeLine(a[0], a[1], b[0], b[1])
+            for (x1, y1, x2, y2, w) in g["tracks"]:
+                gc.SetPen(wx.Pen(_C_KEPT, max(1.0, w * ppm)))
+                a, b = S(x1, y1), S(x2, y2)
+                gc.StrokeLine(a[0], a[1], b[0], b[1])
+            gc.SetBrush(wx.Brush(wx.Colour(255, 235, 59, 150 if is_active else 90)))
+            gc.SetPen(wx.Pen(_C_PAD, 1.0))
+            for (x, y, r) in g["pads"]:
+                cx, cy = S(x, y)
+                rr = max(r * ppm, 4)
+                gc.DrawEllipse(cx - rr, cy - rr, 2 * rr, 2 * rr)
+
+        for res in self.proposed:
+            for (x1, y1, x2, y2, w, lyr) in res.get("segments", []):
+                gc.SetPen(wx.Pen(_C_PROP.get(lyr, _C_PROP_DEFAULT), max(1.0, w * ppm)))
+                a, b = S(x1, y1), S(x2, y2)
+                gc.StrokeLine(a[0], a[1], b[0], b[1])
+            gc.SetBrush(wx.Brush(_C_PROP_VIA))
+            gc.SetPen(wx.Pen(wx.Colour(120, 90, 0), 1.0))
+            for (x, y, dia, drill) in res.get("vias", []):
+                cx, cy = S(x, y)
+                rr = dia / 2.0 * ppm
+                gc.DrawEllipse(cx - rr, cy - rr, 2 * rr, 2 * rr)
 
 
 class RouterDialog(wx.Dialog):
     def __init__(self, board):
-        super().__init__(None, title="dg-router", size=(380, 700),
+        super().__init__(None, title="dg-router", size=(1040, 760),
                          style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER)
         self.board = board
-        # 1-pad nets can't be routed — don't clutter the list with them
         self.nets = [n for n in shim.list_nets(board) if n["pads"] >= 2]
         self.layers = shim.copper_layer_names(board)
         self.status_map = {}
         self.unconn = {}
-        self._added = []            # uncommitted preview items in the board
-        self._proposed_nets = []
-        self._brightened = []       # copper items brightened for highlight
-        self._colored = []          # nets given a temporary net-color
-        self._name2code = {n["name"]: n["code"] for n in self.nets}
-        self._netsettings = None
-        try:
-            self._netsettings = board.GetConnectivity().GetNetSettings()
-        except Exception:
-            pass
+        self.proposed = []
+        self._loaded = False
         self._try_seed = 0
 
         panel = wx.Panel(self)
-        v = wx.BoxSizer(wx.VERTICAL)
+        main = wx.BoxSizer(wx.HORIZONTAL)
+        left = wx.BoxSizer(wx.VERTICAL)
 
-        v.Add(wx.StaticText(panel, label="Nets (%d) — check to route:"
-                            % len(self.nets)), 0, wx.LEFT | wx.TOP, 8)
+        hdr = wx.BoxSizer(wx.HORIZONTAL)
+        hdr.Add(wx.StaticText(panel, label="Nets (%d)" % len(self.nets)),
+                0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 8)
+        self.btn_all = wx.Button(panel, label="All", size=(52, -1))
+        self.btn_none = wx.Button(panel, label="None", size=(60, -1))
+        hdr.AddStretchSpacer(1)
+        hdr.Add(self.btn_all, 0, wx.RIGHT, 4)
+        hdr.Add(self.btn_none, 0)
+        left.Add(hdr, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.TOP, 8)
+
         self.net_list = wx.ListCtrl(panel, style=wx.LC_REPORT | wx.LC_SINGLE_SEL)
         self.net_list.EnableCheckBoxes(True)
-        self.net_list.InsertColumn(0, "Net", width=230)
-        # a WORD column so status is readable even when the row is selected
-        # (the blue selection hides the row text color)
-        self.net_list.InsertColumn(1, "Status", width=88)
+        self.net_list.InsertColumn(0, "Net", width=210)
+        self.net_list.InsertColumn(1, "Status", width=84)
         for n in self.nets:
             row = self.net_list.InsertItem(self.net_list.GetItemCount(),
-                                           "%s   (%d pads)" % (n["name"], n["pads"]))
+                                           "%s  (%d pads)" % (n["name"], n["pads"]))
             self.net_list.SetItem(row, 1, "")
             self.net_list.SetItemTextColour(row, _COL_UNKNOWN)
-        v.Add(self.net_list, 1, wx.EXPAND | wx.ALL, 8)
+        left.Add(self.net_list, 1, wx.EXPAND | wx.ALL, 8)
 
         lrow = wx.BoxSizer(wx.HORIZONTAL)
         lrow.Add(wx.StaticText(panel, label="Route on:"),
@@ -86,7 +292,7 @@ class RouterDialog(wx.Dialog):
             cb.SetValue(name in ("F.Cu", "B.Cu"))
             self.layer_checks[name] = cb
             lrow.Add(cb, 0, wx.RIGHT, 6)
-        v.Add(lrow, 0, wx.LEFT | wx.BOTTOM, 8)
+        left.Add(lrow, 0, wx.LEFT | wx.BOTTOM, 8)
 
         grid = wx.FlexGridSizer(cols=2, vgap=6, hgap=8)
         grid.AddGrowableCol(1, 1)
@@ -95,20 +301,11 @@ class RouterDialog(wx.Dialog):
         self.via_cost = wx.Slider(panel, value=10, minValue=0, maxValue=100,
                                   style=wx.SL_HORIZONTAL | wx.SL_LABELS)
         grid.Add(self.via_cost, 0, wx.EXPAND)
-        grid.Add(wx.StaticText(panel, label="Edge hug (0-100):"),
-                 0, wx.ALIGN_CENTER_VERTICAL)
-        self.edge_hug = wx.Slider(panel, value=0, minValue=0, maxValue=100,
-                                  style=wx.SL_HORIZONTAL | wx.SL_LABELS)
-        grid.Add(self.edge_hug, 0, wx.EXPAND)
-        v.Add(grid, 0, wx.EXPAND | wx.ALL, 8)
-
-        self.follow = wx.CheckBox(panel, label="Follow existing tracks")
-        self.follow.SetValue(True)
-        v.Add(self.follow, 0, wx.LEFT | wx.BOTTOM, 8)
+        left.Add(grid, 0, wx.EXPAND | wx.ALL, 8)
 
         self.btn_route = wx.Button(panel, label="Route")
         self.btn_route.SetDefault()
-        v.Add(self.btn_route, 0, wx.EXPAND | wx.ALL, 8)
+        left.Add(self.btn_route, 0, wx.EXPAND | wx.ALL, 8)
 
         self.act_row = wx.BoxSizer(wx.HORIZONTAL)
         self.btn_commit = wx.Button(panel, label="Accept")
@@ -116,69 +313,95 @@ class RouterDialog(wx.Dialog):
         self.btn_try = wx.Button(panel, label="Try again")
         for b in (self.btn_commit, self.btn_revert, self.btn_try):
             self.act_row.Add(b, 1, wx.RIGHT, 6)
-        v.Add(self.act_row, 0, wx.EXPAND | wx.LEFT | wx.RIGHT, 8)
+        left.Add(self.act_row, 0, wx.EXPAND | wx.LEFT | wx.RIGHT, 8)
 
         self.status = wx.StaticText(panel, label="Loading…")
-        v.Add(self.status, 0, wx.ALL, 8)
+        left.Add(self.status, 0, wx.ALL, 8)
 
-        panel.SetSizer(v)
+        self.preview = PreviewPanel(panel, board)
+        main.Add(left, 0, wx.EXPAND)
+        main.SetItemMinSize(left, 360, -1)
+        main.Add(self.preview, 1, wx.EXPAND | wx.ALL, 6)
+        panel.SetSizer(main)
         self.panel = panel
-        root = wx.BoxSizer(wx.VERTICAL)
-        root.Add(panel, 1, wx.EXPAND)
-        self.SetSizer(root)
+        droot = wx.BoxSizer(wx.VERTICAL)
+        droot.Add(panel, 1, wx.EXPAND)
+        self.SetSizer(droot)
 
         self.btn_route.Bind(wx.EVT_BUTTON, self.on_route)
         self.btn_try.Bind(wx.EVT_BUTTON, self.on_try_again)
         self.btn_commit.Bind(wx.EVT_BUTTON, self.on_commit)
         self.btn_revert.Bind(wx.EVT_BUTTON, self.on_revert)
+        self.btn_all.Bind(wx.EVT_BUTTON, lambda e: self._check_all(True))
+        self.btn_none.Bind(wx.EVT_BUTTON, lambda e: self._check_all(False))
         self.net_list.Bind(wx.EVT_LIST_ITEM_SELECTED, self.on_select)
         self.net_list.Bind(wx.EVT_LIST_ITEM_CHECKED, self.on_check)
         self.net_list.Bind(wx.EVT_LIST_ITEM_UNCHECKED, self.on_check)
         self.Bind(wx.EVT_CLOSE, self.on_close)
 
-        self._loaded = False
         self._show_actions(False)
         self._update_route_enabled()
         if self.board.GetFileName():
             self.status.SetLabel("Loading routing status…")
-            # run the slow DRC off the UI thread so the window is responsive
             threading.Thread(target=self._status_worker,
                              args=(self.board.GetFileName(),), daemon=True).start()
         else:
             self.status.SetLabel("Save the board to begin.")
 
-    # --- helpers ------------------------------------------------------------
-
+    # --- helpers ---
     def _show_actions(self, show):
         self.act_row.ShowItems(show)
         self.btn_route.Show(not show)
-        self.panel.Layout()   # the sizer lives on the panel, not the dialog
+        self.panel.Layout()
 
     def _update_route_enabled(self):
         self.btn_route.Enable(self._loaded and bool(self._checked_names()))
+
+    def _checked_names(self):
+        return [self.nets[i]["name"] for i in range(self.net_list.GetItemCount())
+                if self.net_list.IsItemChecked(i)]
+
+    def _active_name(self):
+        sel = self.net_list.GetFirstSelected()
+        return self.nets[sel]["name"] if sel != -1 else None
+
+    def _check_all(self, on):
+        for i in range(self.net_list.GetItemCount()):
+            self.net_list.CheckItem(i, on)
+        self._update_route_enabled()
+        self._refresh_highlight()
 
     def on_check(self, _evt):
         self._update_route_enabled()
         self._refresh_highlight()
 
-    def _apply_status_colors(self):
+    def on_select(self, _evt):
+        self._refresh_highlight()
+
+    def _refresh_highlight(self):
+        active = self._active_name()
+        names = set(self._checked_names())
+        if active:
+            names.add(active)
+        self.preview.set_selected(sorted(names), active)
+
+    def _apply_status(self):
         for i, n in enumerate(self.nets):
             st = self.status_map.get(n["name"])
             self.net_list.SetItemTextColour(i, _STATUS_COL.get(st, _COL_UNKNOWN))
             self.net_list.SetItem(i, 1, _STATUS_WORD.get(st, ""))
 
     def _status_worker(self, bp):
-        """Runs on a background thread: only the slow kicad-cli DRC."""
         try:
             unconn = shim.drc_unconnected(bp)
         except Exception as e:  # noqa: BLE001
-            wx.CallAfter(self.status.SetLabel, "Routing status unavailable: %s" % e)
+            wx.CallAfter(self.status.SetLabel, "Status unavailable: %s" % e)
             return
         wx.CallAfter(self._status_ready, unconn)
 
     def _status_ready(self, unconn):
-        """Back on the UI thread: derive per-net status + apply."""
         self.unconn = unconn
+        self.preview.set_routing(unconn)
         code_name = {n["code"]: n["name"] for n in self.nets}
         has_cu = {}
         for t in self.board.GetTracks():
@@ -187,8 +410,6 @@ class RouterDialog(wx.Dialog):
                 has_cu[nm] = True
         self.status_map = {}
         for n in self.nets:
-            if n["pads"] < 2:
-                continue
             name = n["name"]
             if len(unconn.get(name, [])) == 0:
                 self.status_map[name] = "routed"
@@ -196,7 +417,7 @@ class RouterDialog(wx.Dialog):
                 self.status_map[name] = "partial"
             else:
                 self.status_map[name] = "unrouted"
-        self._apply_status_colors()
+        self._apply_status()
         self._loaded = True
         self._update_route_enabled()
         c = {"routed": 0, "partial": 0, "unrouted": 0}
@@ -204,22 +425,6 @@ class RouterDialog(wx.Dialog):
             c[x] += 1
         self.status.SetLabel("%d routed  %d partial  %d unrouted"
                              % (c["routed"], c["partial"], c["unrouted"]))
-
-    def _reset_pass(self):
-        """After Accept/Reject: clear selection + highlight, re-cock for the
-        next pass."""
-        for i in range(self.net_list.GetItemCount()):
-            if self.net_list.IsItemChecked(i):
-                self.net_list.CheckItem(i, False)
-        self._clear_highlight()
-        self._proposed_nets = []
-        self._refresh_canvas()
-        self._show_actions(False)
-        self._update_route_enabled()
-
-    def _checked_names(self):
-        return [self.nets[i]["name"] for i in range(self.net_list.GetItemCount())
-                if self.net_list.IsItemChecked(i)]
 
     def selected_layers(self):
         chosen = [n for n, cb in self.layer_checks.items() if cb.GetValue()]
@@ -230,85 +435,14 @@ class RouterDialog(wx.Dialog):
             self.board, via_cost=float(self.via_cost.GetValue()),
             layer_names=self.selected_layers(), seed=self._try_seed, jitter=jitter)
 
-    def _remove_added(self):
-        for it in self._added:
-            try:
-                self.board.Remove(it)
-            except Exception:
-                pass
-        if self._added:
-            router.refill_zones(self.board)
-        self._added = []
-
     def _refresh_canvas(self):
         try:
             self.board.BuildConnectivity()
             pcbnew.Refresh()
-            pcbnew.UpdateUserInterface()
         except Exception:
             pass
 
-    def _color_net(self, name, rgb):
-        """Assign a native KiCad net color (colors copper + ratsnest). No board
-        geometry is added, so nothing is left behind."""
-        if self._netsettings is None:
-            return
-        try:
-            self._netsettings.SetNetColorAssignment(
-                name, pcbnew.COLOR4D(rgb[0], rgb[1], rgb[2], 1.0))
-            self._colored.append(name)
-        except Exception:
-            pass
-
-    def _brighten_net(self, name):
-        code = self._name2code.get(name)
-        if code is None:
-            return
-        for it in list(self.board.GetPads()) + list(self.board.GetTracks()):
-            if it.GetNetCode() == code:
-                it.SetBrightened()
-                self._brightened.append(it)
-
-    def _clear_highlight(self):
-        for it in self._brightened:
-            try:
-                it.ClearBrightened()
-            except Exception:
-                pass
-        self._brightened = []
-        if self._netsettings is not None:
-            for name in self._colored:
-                try:  # reset just OUR nets (don't nuke the user's net colors)
-                    self._netsettings.SetNetColorAssignment(
-                        name, pcbnew.COLOR4D(0, 0, 0, 0))
-                except Exception:
-                    pass
-        self._colored = []
-
-    def _refresh_highlight(self):
-        """Highlight all CHECKED nets brightly and the ACTIVE (selected) net even
-        brighter, using native net colors + copper brightening."""
-        self._clear_highlight()
-        checked = set(self._checked_names())
-        active = None
-        sel = self.net_list.GetFirstSelected()
-        if sel != -1:
-            active = self.nets[sel]["name"]
-        for name in checked:
-            if name == active:
-                continue
-            self._color_net(name, _HL_CHECKED)
-            self._brighten_net(name)
-        if active:
-            self._color_net(active, _HL_ACTIVE)   # even brighter than checked
-            self._brighten_net(active)
-        self._refresh_canvas()
-
-    def on_select(self, _evt):
-        self._refresh_highlight()
-
-    # --- routing (drawn into KiCad) ----------------------------------------
-
+    # --- routing (preview-first: proposed shown in the panel, not the board) ---
     def _compute(self, jitter):
         names = self._checked_names()
         if not names:
@@ -318,83 +452,79 @@ class RouterDialog(wx.Dialog):
         if not bp or not os.path.exists(bp):
             wx.MessageBox("Save the board first.", "dg-router")
             return
-
-        self._remove_added()     # replace any previous uncommitted preview
-        self._clear_highlight()  # stale ratsnest for routed nets would mislead
         self.status.SetLabel("Routing…")
         wx.BeginBusyCursor()
         try:
-            params = self._params(jitter=jitter)
             unconn = self.unconn or shim.drc_unconnected(bp)
-            results = router.route_batch(self.board, names, unconn, params)
-            added = []
-            for r in results:
-                if r.get("segments") or r.get("vias"):
-                    added += router.write_result(self.board, r["net_code"], r)
-            router.refill_zones(self.board)
-            self._added = added
-            self._proposed_nets = [r["net"] for r in results]
+            results = router.route_batch(self.board, names, unconn,
+                                         self._params(jitter=jitter))
         except Exception as e:  # noqa: BLE001
             wx.EndBusyCursor()
             wx.MessageBox("Routing error:\n%s\n\n%s" % (e, traceback.format_exc()),
                           "dg-router")
             return
         wx.EndBusyCursor()
-        self._refresh_canvas()
 
+        self.proposed = results
+        self.preview.set_proposed(results)   # shown in preview only
         seg = sum(len(r.get("segments", [])) for r in results)
         via = sum(len(r.get("vias", [])) for r in results)
         if seg == 0 and via == 0:
-            # nothing routed — say WHY, keep the nets highlighted, stay on Route
-            reasons = []
-            for r in results:
-                if not r.get("ok"):
-                    reasons.append("%s: %s" % (r["net"], r.get("reason") or
-                                               "no clear path (try more layers / "
-                                               "higher via cost)"))
-            self.status.SetLabel("Couldn't route — " + "; ".join(reasons[:3]))
-            self._refresh_highlight()
+            why = "; ".join("%s: %s" % (r["net"], r.get("reason") or "no path")
+                            for r in results if not r.get("ok"))
+            self.status.SetLabel("Couldn't route — " + why[:80])
             self._show_actions(False)
             return
-
-        incomplete = sum(1 for r in results if not r.get("ok"))
+        bad = sum(1 for r in results if not r.get("ok"))
         msg = "Proposed %d tracks, %d vias" % (seg, via)
-        if incomplete:
-            msg += "  (%d net%s incomplete)" % (incomplete,
-                                                "" if incomplete == 1 else "s")
+        if bad:
+            msg += "  (%d incomplete)" % bad
         self.status.SetLabel(msg + " — Accept / Reject / Try again")
         self._show_actions(True)
 
     def on_route(self, _evt):
         self._try_seed = 0
-        self._compute(jitter=0.0)
+        self._compute(0.0)
 
     def on_try_again(self, _evt):
         self._try_seed += 1
-        self._compute(jitter=0.35)   # keeps selection; different solution
+        self._compute(0.35)
 
-    def on_revert(self, _evt):       # Reject
-        self._remove_added()
-        self.status.SetLabel("Rejected — nothing kept. Pick nets and Route again.")
+    def on_revert(self, _evt):
+        self.proposed = []
+        self.preview.set_proposed([])
+        self.status.SetLabel("Rejected. Pick nets and Route again.")
         self._reset_pass()
 
-    def on_commit(self, _evt):       # Accept
-        for name in self._proposed_nets:
+    def on_commit(self, _evt):
+        added = 0
+        done = []
+        for r in self.proposed:
+            if r.get("segments") or r.get("vias"):
+                added += len(router.write_result(self.board, r["net_code"], r))
+            done.append(r["net"])
+        router.refill_zones(self.board)
+        self._refresh_canvas()
+        for name in done:
             self.status_map[name] = "routed"
-        self._apply_status_colors()
-        n = len(self._added)
-        self._added = []             # keep them in the board; stop tracking
-        self.status.SetLabel("Accepted %d items (Cmd+S to save). "
-                             "Pick nets and Route again." % n)
+            self.unconn[name] = []
+        self._apply_status()
+        self.proposed = []
+        self.preview.set_proposed([])
+        self.preview.set_routing(self.unconn)
+        self.status.SetLabel("Accepted %d items (Cmd+S to save). Route again."
+                             % added)
         self._reset_pass()
 
-    # --- misc ---------------------------------------------------------------
+    def _reset_pass(self):
+        for i in range(self.net_list.GetItemCount()):
+            if self.net_list.IsItemChecked(i):
+                self.net_list.CheckItem(i, False)
+        self._refresh_highlight()
+        self._show_actions(False)
+        self._update_route_enabled()
 
     def on_close(self, _evt):
-        # discard any uncommitted preview + highlight so we leave a clean board
-        self._remove_added()
-        self._clear_highlight()
-        self._refresh_canvas()
         if self in _OPEN:
             _OPEN.remove(self)
         self.Destroy()
@@ -403,4 +533,4 @@ class RouterDialog(wx.Dialog):
 def show_dialog(board):
     dlg = RouterDialog(board)
     _OPEN.append(dlg)
-    dlg.Show()   # non-modal: KiCad canvas stays interactive for review
+    dlg.Show()
