@@ -33,7 +33,7 @@ _C_PROP_DEFAULT = wx.Colour(230, 230, 230)
 _C_PROP_VIA = wx.Colour(255, 235, 59)
 _BG = wx.Colour(24, 24, 24)
 
-_BG_PPM = 22.0  # background raster resolution (px per mm) — crisp when zoomed
+_BG_PPM = 16.0  # background raster resolution (px per mm)
 
 _STATUS_EMOJI = {None: "", "routed": "✅", "partial": "🟡", "unrouted": "⚪"}
 
@@ -54,7 +54,6 @@ class PreviewPanel(wx.Panel):
         self.unconn = {}
         self.status_loaded = False
         self.proposed = []          # list of route result dicts
-        self._heat = None           # live A* exploration overlay bitmap
         self.zoom = 1.0
         self.panx = self.pany = 0.0
         self._drag = None
@@ -91,37 +90,6 @@ class PreviewPanel(wx.Panel):
         for name in names:
             self.unconn[name] = []
             self._geom_cache.pop(name, None)
-        self.Refresh()
-
-    # --- live A* exploration overlay ---------------------------------------
-
-    def begin_search(self):
-        if self.bg_bmp is None:
-            return
-        self._heat = wx.Bitmap.FromRGBA(self.bg_bmp.GetWidth(),
-                                        self.bg_bmp.GetHeight(), 0, 0, 0, 0)
-        self.Refresh()
-        self.Update()
-
-    def add_search(self, cm, cells):
-        if self._heat is None or self.origin is None:
-            return
-        orx, ory = self.origin
-        dc = wx.MemoryDC(self._heat)
-        gc = wx.GraphicsContext.Create(dc)
-        gc.SetPen(wx.Pen(wx.Colour(0, 0, 0, 0), 0))
-        gc.SetBrush(wx.Brush(wx.Colour(80, 150, 255, 60)))
-        for (i, j, _li) in cells:
-            wxmm, wymm = cm.to_world(i, j)
-            bx = (wxmm - orx) * _BG_PPM
-            by = (wymm - ory) * _BG_PPM
-            gc.DrawRectangle(bx - 2, by - 2, 4, 4)
-        dc.SelectObject(wx.NullBitmap)
-        self.Refresh()
-        self.Update()
-
-    def end_search(self):
-        self._heat = None
         self.Refresh()
 
     def _ratsnest_for(self, name, geom):
@@ -217,54 +185,62 @@ class PreviewPanel(wx.Panel):
             self._center_text(dc, "Rendering board…")
             return
 
+        cw, ch = self.GetClientSize()
         ppm = self._ppm()
         bx0, by0 = self._origin_screen(ppm)
-        s = ppm / _BG_PPM
         orx, ory = self.origin
+        bgW, bgH = self.bg_bmp.GetWidth(), self.bg_bmp.GetHeight()
+        k = _BG_PPM / ppm    # bg-bitmap px per screen px
+
+        # Blit ONLY the visible sub-region of the board bitmap, scaled to the
+        # screen. Cost is bounded by the panel size, not the zoom level — this
+        # is what keeps zoom/pan fast.
+        sx0 = max(0, int((0 - bx0) * k))
+        sy0 = max(0, int((0 - by0) * k))
+        sx1 = min(bgW, int((cw - bx0) * k) + 2)
+        sy1 = min(bgH, int((ch - by0) * k) + 2)
+        if sx1 > sx0 and sy1 > sy0:
+            sub = self.bg_bmp.GetSubBitmap(wx.Rect(sx0, sy0, sx1 - sx0, sy1 - sy0))
+            dw = max(1, int((sx1 - sx0) / k))
+            dh = max(1, int((sy1 - sy0) / k))
+            scaled = sub.ConvertToImage().Scale(
+                dw, dh, wx.IMAGE_QUALITY_NORMAL).ConvertToBitmap()
+            dc.DrawBitmap(scaled, int(bx0 + sx0 / k), int(by0 + sy0 / k))
+
+        def S(x, y):  # mm -> screen px
+            return (bx0 + (x - orx) * ppm, by0 + (y - ory) * ppm)
+
         gc = wx.GraphicsContext.Create(dc)
-        gc.Translate(bx0, by0)
-        gc.Scale(s, s)
-        gc.DrawBitmap(self.bg_bmp, 0, 0, self.bg_bmp.GetWidth(),
-                      self.bg_bmp.GetHeight())
-        if self._heat is not None:
-            gc.DrawBitmap(self._heat, 0, 0, self._heat.GetWidth(),
-                          self._heat.GetHeight())
-
-        def B(x, y):  # mm -> bitmap px (the gc scale handles zoom)
-            return ((x - orx) * _BG_PPM, (y - ory) * _BG_PPM)
-
-        # selected-net highlight
         for name in self.selected:
             g = self._geom_cache.get(name)
             if not g:
                 continue
             gc.SetPen(wx.Pen(_C_TODO, 1.5, wx.PENSTYLE_SHORT_DASH))
             for (x1, y1, x2, y2) in self._ratsnest_for(name, g):
-                a, b = B(x1, y1), B(x2, y2)
+                a, b = S(x1, y1), S(x2, y2)
                 gc.StrokeLine(a[0], a[1], b[0], b[1])
             for (x1, y1, x2, y2, w) in g["tracks"]:
-                gc.SetPen(wx.Pen(_C_KEPT, max(1.0, w * _BG_PPM)))
-                a, b = B(x1, y1), B(x2, y2)
+                gc.SetPen(wx.Pen(_C_KEPT, max(1.0, w * ppm)))
+                a, b = S(x1, y1), S(x2, y2)
                 gc.StrokeLine(a[0], a[1], b[0], b[1])
             gc.SetBrush(wx.Brush(wx.Colour(255, 235, 59, 140)))
             gc.SetPen(wx.Pen(_C_PAD, 1.0))
             for (x, y, r) in g["pads"]:
-                cx, cy = B(x, y)
-                rr = max(r * _BG_PPM, 4)
+                cx, cy = S(x, y)
+                rr = max(r * ppm, 4)
                 gc.DrawEllipse(cx - rr, cy - rr, 2 * rr, 2 * rr)
 
-        # proposed routes
         for res in self.proposed:
             for (x1, y1, x2, y2, w, lyr) in res.get("segments", []):
-                col = _C_PROP.get(lyr, _C_PROP_DEFAULT)
-                gc.SetPen(wx.Pen(col, max(1.0, w * _BG_PPM)))
-                a, b = B(x1, y1), B(x2, y2)
+                gc.SetPen(wx.Pen(_C_PROP.get(lyr, _C_PROP_DEFAULT),
+                                 max(1.0, w * ppm)))
+                a, b = S(x1, y1), S(x2, y2)
                 gc.StrokeLine(a[0], a[1], b[0], b[1])
             gc.SetBrush(wx.Brush(_C_PROP_VIA))
             gc.SetPen(wx.Pen(wx.Colour(120, 90, 0), 1.0))
             for (x, y, dia, drill) in res.get("vias", []):
-                cx, cy = B(x, y)
-                rr = dia / 2.0 * _BG_PPM
+                cx, cy = S(x, y)
+                rr = dia / 2.0 * ppm
                 gc.DrawEllipse(cx - rr, cy - rr, 2 * rr, 2 * rr)
 
 
@@ -332,14 +308,9 @@ class RouterDialog(wx.Dialog):
         self.follow.SetValue(True)
         left.Add(self.follow, 0, wx.LEFT | wx.BOTTOM, 8)
 
-        # primary Route button (big)
-        self.btn_route = wx.Button(panel, label="Route checked  ▶",
-                                   size=(-1, 40))
+        # primary Route button
+        self.btn_route = wx.Button(panel, label="Route checked")
         self.btn_route.SetDefault()
-        f = self.btn_route.GetFont()
-        f.SetPointSize(f.GetPointSize() + 2)
-        f.MakeBold()
-        self.btn_route.SetFont(f)
         left.Add(self.btn_route, 0, wx.EXPAND | wx.ALL, 8)
 
         # after-route action buttons (hidden until a preview exists)
@@ -467,52 +438,28 @@ class RouterDialog(wx.Dialog):
             return
         self.status.SetLabel("Routing…")
         self.preview.set_proposed([])
-        self.preview.begin_search()
-
-        def on_progress(cm, cells):
-            self.preview.add_search(cm, cells)
-            wx.SafeYield(self.preview, True)
-
+        wx.BeginBusyCursor()
         try:
             params = self._params(jitter=jitter)
             unconn = self.preview.unconn if self.preview.status_loaded \
                 else shim.drc_unconnected(bp)
-            results = router.route_batch(self.board, names, unconn, params,
-                                         on_progress=on_progress)
+            results = router.route_batch(self.board, names, unconn, params)
         except Exception as e:  # noqa: BLE001
-            self.preview.end_search()
+            wx.EndBusyCursor()
             wx.MessageBox("Routing error:\n%s\n\n%s" % (e, traceback.format_exc()),
                           "dg-router")
             return
-        self.preview.end_search()
+        wx.EndBusyCursor()
 
         self.proposed = results
         self.preview.set_proposed(results)
-        connected = self._verify(results)   # DRC on a throwaway copy
         ntracks = sum(len(r.get("segments", [])) for r in results)
         nvias = sum(len(r.get("vias", [])) for r in results)
-        ok = sum(1 for r in results if connected.get(r["net"]))
+        ok = sum(1 for r in results if r.get("ok"))
         self.status.SetLabel(
-            "Proposed: %d/%d nets connected, %d segs, %d vias — "
+            "Proposed: %d/%d nets routed, %d segs, %d vias — "
             "Commit / Try again / Revert" % (ok, len(results), ntracks, nvias))
         self._show_actions(True)
-
-    def _verify(self, results):
-        """Apply proposed to a throwaway copy and DRC it — returns
-        {net: connected?}. The live board/file are never touched."""
-        try:
-            tmp = os.path.join(tempfile.gettempdir(), "dg-verify.kicad_pcb")
-            pcbnew.SaveBoard(tmp, self.board)
-            vb = pcbnew.LoadBoard(tmp)
-            for r in results:
-                if r.get("segments") or r.get("vias"):
-                    router.write_result(vb, r["net_code"], r)
-            router.refill_zones(vb)
-            pcbnew.SaveBoard(tmp, vb)
-            after = shim.drc_unconnected(tmp)
-            return {r["net"]: not after.get(r["net"]) for r in results}
-        except Exception:  # noqa: BLE001
-            return {r["net"]: r.get("ok", False) for r in results}
 
     def on_route(self, _evt):
         self._try_seed = 0
