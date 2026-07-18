@@ -44,6 +44,8 @@ class RouterDialog(wx.Dialog):
         self.unconn = {}
         self._added = []            # uncommitted preview items in the board
         self._proposed_nets = []
+        self._brightened = []       # items highlighted for the selected net
+        self._name2code = {n["name"]: n["code"] for n in self.nets}
         self._try_seed = 0
 
         panel = wx.Panel(self)
@@ -89,7 +91,7 @@ class RouterDialog(wx.Dialog):
         self.follow.SetValue(True)
         v.Add(self.follow, 0, wx.LEFT | wx.BOTTOM, 8)
 
-        self.btn_route = wx.Button(panel, label="Route checked")
+        self.btn_route = wx.Button(panel, label="Route")
         self.btn_route.SetDefault()
         v.Add(self.btn_route, 0, wx.EXPAND | wx.ALL, 8)
 
@@ -121,6 +123,7 @@ class RouterDialog(wx.Dialog):
         self.btn_revert.Bind(wx.EVT_BUTTON, self.on_revert)
         self.btn_open.Bind(wx.EVT_BUTTON, self.on_open)
         self.btn_emit.Bind(wx.EVT_BUTTON, self.on_emit)
+        self.net_list.Bind(wx.EVT_LIST_ITEM_SELECTED, self.on_select)
         self.Bind(wx.EVT_BUTTON, self.on_close_btn, id=wx.ID_CANCEL)
         self.Bind(wx.EVT_CLOSE, self.on_close)
 
@@ -192,6 +195,33 @@ class RouterDialog(wx.Dialog):
             self.board.BuildConnectivity()
             pcbnew.Refresh()
             pcbnew.UpdateUserInterface()
+        except Exception:
+            pass
+
+    def _clear_highlight(self):
+        for it in self._brightened:
+            try:
+                it.ClearBrightened()
+            except Exception:
+                pass
+        self._brightened = []
+
+    def on_select(self, evt):
+        """Highlight the clicked net's copper in KiCad's canvas (brighten)."""
+        idx = evt.GetIndex()
+        self._clear_highlight()
+        code = self._name2code.get(self.nets[idx]["name"])
+        if code is not None:
+            for pad in self.board.GetPads():
+                if pad.GetNetCode() == code:
+                    pad.SetBrightened()
+                    self._brightened.append(pad)
+            for t in self.board.GetTracks():
+                if t.GetNetCode() == code:
+                    t.SetBrightened()
+                    self._brightened.append(t)
+        try:
+            pcbnew.Refresh()
         except Exception:
             pass
 
@@ -289,8 +319,9 @@ class RouterDialog(wx.Dialog):
         self.Close()
 
     def on_close(self, _evt):
-        # discard any uncommitted preview so we don't leave surprise copper
+        # discard any uncommitted preview + highlight so we leave a clean board
         self._remove_added()
+        self._clear_highlight()
         self._refresh_canvas()
         if self in _OPEN:
             _OPEN.remove(self)
