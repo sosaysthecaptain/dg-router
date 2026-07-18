@@ -66,13 +66,11 @@ def build():
                     if 0 <= xx < W and 0 <= yy < H:
                         px[yy * W + xx] = GREEN
 
-    # octilinear trace with a 45deg bend: horizontal -> 45 -> vertical, via at
-    # each end. Shifted right so the trace is centered in the field.
-    line(13, 35, 24, 35, 2)     # horizontal in
-    line(24, 35, 33, 26, 2)     # 45-degree bend
-    line(33, 26, 33, 14, 2)     # vertical up
-    dot(13, 35, 4)
-    dot(33, 14, 4)
+    # right-angle trace with a via at each end, centered in the field
+    line(14, 34, 34, 34, 2)     # horizontal
+    line(34, 34, 34, 14, 2)     # right angle up
+    dot(14, 34, 4)
+    dot(34, 14, 4)
     return px
 
 
