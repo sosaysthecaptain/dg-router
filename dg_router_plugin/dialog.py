@@ -54,6 +54,7 @@ class PreviewPanel(wx.Panel):
         self.unconn = {}
         self.status_loaded = False
         self.proposed = []          # list of route result dicts
+        self._heat = None           # live A* exploration overlay bitmap
         self.zoom = 1.0
         self.panx = self.pany = 0.0
         self._drag = None
@@ -90,6 +91,37 @@ class PreviewPanel(wx.Panel):
         for name in names:
             self.unconn[name] = []
             self._geom_cache.pop(name, None)
+        self.Refresh()
+
+    # --- live A* exploration overlay ---------------------------------------
+
+    def begin_search(self):
+        if self.bg_bmp is None:
+            return
+        self._heat = wx.Bitmap.FromRGBA(self.bg_bmp.GetWidth(),
+                                        self.bg_bmp.GetHeight(), 0, 0, 0, 0)
+        self.Refresh()
+        self.Update()
+
+    def add_search(self, cm, cells):
+        if self._heat is None or self.origin is None:
+            return
+        orx, ory = self.origin
+        dc = wx.MemoryDC(self._heat)
+        gc = wx.GraphicsContext.Create(dc)
+        gc.SetPen(wx.Pen(wx.Colour(0, 0, 0, 0), 0))
+        gc.SetBrush(wx.Brush(wx.Colour(80, 150, 255, 60)))
+        for (i, j, _li) in cells:
+            wxmm, wymm = cm.to_world(i, j)
+            bx = (wxmm - orx) * _BG_PPM
+            by = (wymm - ory) * _BG_PPM
+            gc.DrawRectangle(bx - 2, by - 2, 4, 4)
+        dc.SelectObject(wx.NullBitmap)
+        self.Refresh()
+        self.Update()
+
+    def end_search(self):
+        self._heat = None
         self.Refresh()
 
     def _ratsnest_for(self, name, geom):
@@ -194,6 +226,9 @@ class PreviewPanel(wx.Panel):
         gc.Scale(s, s)
         gc.DrawBitmap(self.bg_bmp, 0, 0, self.bg_bmp.GetWidth(),
                       self.bg_bmp.GetHeight())
+        if self._heat is not None:
+            gc.DrawBitmap(self._heat, 0, 0, self._heat.GetWidth(),
+                          self._heat.GetHeight())
 
         def B(x, y):  # mm -> bitmap px (the gc scale handles zoom)
             return ((x - orx) * _BG_PPM, (y - ory) * _BG_PPM)
@@ -431,18 +466,25 @@ class RouterDialog(wx.Dialog):
             wx.MessageBox("Save the board first.", "dg-router")
             return
         self.status.SetLabel("Routing…")
-        wx.BeginBusyCursor()
+        self.preview.set_proposed([])
+        self.preview.begin_search()
+
+        def on_progress(cm, cells):
+            self.preview.add_search(cm, cells)
+            wx.SafeYield(self.preview, True)
+
         try:
             params = self._params(jitter=jitter)
             unconn = self.preview.unconn if self.preview.status_loaded \
                 else shim.drc_unconnected(bp)
-            results = router.route_batch(self.board, names, unconn, params)
+            results = router.route_batch(self.board, names, unconn, params,
+                                         on_progress=on_progress)
         except Exception as e:  # noqa: BLE001
-            wx.EndBusyCursor()
+            self.preview.end_search()
             wx.MessageBox("Routing error:\n%s\n\n%s" % (e, traceback.format_exc()),
                           "dg-router")
             return
-        wx.EndBusyCursor()
+        self.preview.end_search()
 
         self.proposed = results
         self.preview.set_proposed(results)

@@ -256,12 +256,15 @@ def nearest_free(cm, li, cell, max_rings=16):
     return None
 
 
-def astar(cm, starts, goal_cell, goal_layers, params, max_expansions=1_500_000):
+def astar(cm, starts, goal_cell, goal_layers, params, max_expansions=1_500_000,
+          on_progress=None, progress_every=600):
     """starts: list of (i,j,li). goal reached at goal_cell on any goal layer.
-    Returns list of (i,j,li) or None."""
+    Returns list of (i,j,li) or None. on_progress(cm, new_cells) is called
+    periodically with cells popped since the last call (for live animation)."""
     gx, gy = goal_cell
     goalset = set(goal_layers)
     attract_bonus = 0.6
+    new_cells = []
 
     def h(i, j):
         dx, dy = abs(i - gx), abs(j - gy)
@@ -283,12 +286,19 @@ def astar(cm, starts, goal_cell, goal_layers, params, max_expansions=1_500_000):
         _, gc, st = heapq.heappop(open_heap)
         ci, cj, cl, cd = st
         if (ci, cj) == goal_cell and cl in goalset:
+            if on_progress and new_cells:
+                on_progress(cm, new_cells)
             return _reconstruct(came, st)
         if gc > g.get(st, 1e18):
             continue
         seen += 1
         if seen > max_expansions:
             return None
+        if on_progress:
+            new_cells.append((ci, cj, cl))
+            if len(new_cells) >= progress_every:
+                on_progress(cm, new_cells)
+                new_cells = []
         # in-plane moves
         for nd, (di, dj) in enumerate(_DIRS):
             ni, nj = ci + di, cj + dj
@@ -487,7 +497,7 @@ def _pad_layers_at(board, net_code, x, y, routable):
 
 
 def route_net(board, net_name, gaps, params, prior_segments=None,
-              prior_vias=None, attract_paths=None):
+              prior_vias=None, attract_paths=None, on_progress=None):
     net = _find_net(board, net_name)
     if net is None:
         return {"net": net_name, "ok": False, "reason": "net not found"}
@@ -523,7 +533,7 @@ def route_net(board, net_name, gaps, params, prior_segments=None,
                 break
         if not starts or goal_cell is None:
             continue
-        cells3 = astar(cm, starts, goal_cell, gl, params)
+        cells3 = astar(cm, starts, goal_cell, gl, params, on_progress=on_progress)
         if not cells3:
             continue
 
@@ -593,7 +603,7 @@ def refill_zones(board):
         pass
 
 
-def route_batch(board, net_names, unconn, params):
+def route_batch(board, net_names, unconn, params, on_progress=None):
     """Route a batch. Nets already routed this batch are (a) obstacles for the
     rest (no crossing/shorting) and (b) attractors (bus bundling). Longest net
     first anchors the bus. Does NOT mutate the board."""
@@ -611,7 +621,8 @@ def route_batch(board, net_names, unconn, params):
                             "gaps": 0, "routed": 0, "segments": [], "vias": []})
             continue
         r = route_net(board, name, gaps, params, prior_segments=prior_segments,
-                      prior_vias=prior_vias, attract_paths=attract)
+                      prior_vias=prior_vias, attract_paths=attract,
+                      on_progress=on_progress)
         results.append(r)
         prior_segments += r.get("segments", [])
         prior_vias += r.get("vias", [])
