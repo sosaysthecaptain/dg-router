@@ -240,14 +240,18 @@ class CostMap:
                                rr + tclr)
             else:
                 lyr = t.GetLayer()
-                if lyr not in lset:
-                    continue
                 s, e = t.GetStart(), t.GetEnd()
                 rr = t.GetWidth() / 2.0 / _NM
-                self._seg(self.blocked[lidx[lyr]], s.x / _NM, s.y / _NM,
-                          e.x / _NM, e.y / _NM, rr + tclr)
-                self._seg(self.via_blocked, s.x / _NM, s.y / _NM,
-                          e.x / _NM, e.y / _NM, rr + vclr)
+                if lyr in lset:
+                    self._seg(self.blocked[lidx[lyr]], s.x / _NM, s.y / _NM,
+                              e.x / _NM, e.y / _NM, rr + tclr)
+                    self._seg(self.via_blocked, s.x / _NM, s.y / _NM,
+                              e.x / _NM, e.y / _NM, rr + vclr)
+                elif pcbnew.IsCopperLayer(lyr):
+                    # a through-via passes through inner layers too, so it must
+                    # avoid inner-layer tracks (planes pull back on their own)
+                    self._seg(self.via_blocked, s.x / _NM, s.y / _NM,
+                              e.x / _NM, e.y / _NM, rr + vclr)
 
     def stamp_prior(self, segments, vias, our_width):
         """Stamp already-routed batch nets as obstacles so the next net in the
@@ -549,6 +553,59 @@ def _octi_pull_lg(lg, cells):
         out.append(cells[best])
         i = best
     return [lg.to_world(*c) for c in out]
+
+
+def _octi_corner_world(a, b):
+    d = min(abs(b[0] - a[0]), abs(b[1] - a[1]))
+    return (a[0] + _sgn(b[0] - a[0]) * d, a[1] + _sgn(b[1] - a[1]) * d)
+
+
+def _seg_clear_world(cm, li, a, b):
+    """Sample the world segment a->b against the coarse blocked grid, rejecting
+    diagonal corner-cuts (squeezing between two diagonally-adjacent blocked
+    cells) — otherwise a cleaned 45deg segment could short."""
+    dx, dy = b[0] - a[0], b[1] - a[1]
+    L = math.hypot(dx, dy)
+    n = max(1, int(L / (cm.pitch * 0.4)))
+    sdi, sdj = _sgn(dx), _sgn(dy)
+
+    def blk(ii, jj):
+        return (not cm.in_bounds(ii, jj)) or cm.blocked_at(li, ii, jj)
+
+    for k in range(n + 1):
+        t = k / n
+        i, j = cm.to_cell(a[0] + dx * t, a[1] + dy * t)
+        if blk(i, j):
+            return False
+        if sdi and sdj and blk(i + sdi, j) and blk(i, j + sdj):
+            return False
+    return True
+
+
+def _octi_cleanup(cm, li, pts):
+    """Greedy octilinear reduction of a world-space polyline (escape+coarse
+    stitched), clearance-checked on the coarse grid. Turns the near-45/near-axis
+    jog at the fine/coarse seam into clean 45deg+orthogonal geometry; falls back
+    to the original vertices wherever a shortcut isn't clear, so it can never add
+    a violation."""
+    if len(pts) <= 2:
+        return list(pts)
+    out = [pts[0]]
+    i, n = 0, len(pts)
+    while i < n - 1:
+        best = i + 1
+        for j in range(n - 1, i, -1):
+            corner = _octi_corner_world(pts[i], pts[j])
+            if (_seg_clear_world(cm, li, pts[i], corner)
+                    and _seg_clear_world(cm, li, corner, pts[j])):
+                best = j
+                break
+        corner = _octi_corner_world(pts[i], pts[best])
+        if corner != pts[i] and corner != pts[best]:
+            out.append(corner)
+        out.append(pts[best])
+        i = best
+    return out
 
 
 # --- pad entry + neck-down --------------------------------------------------
@@ -1032,6 +1089,7 @@ def route_net(board, net_name, gaps, params, prior_segments=None,
                         cpoly = es_pts[:-1] + cpoly
                     if ri == len(runs) - 1:
                         cpoly = cpoly + eg_pts[::-1][1:]
+                    cpoly = _octi_cleanup(cm, li, cpoly)   # clean the seam jog
                     ns = neck_s if ri == 0 else width
                     ne = neck_e if ri == len(runs) - 1 else width
                     gap_segs += build_segments(cpoly, routable[li], width, ns, ne)
@@ -1171,6 +1229,7 @@ def auto_trunk(board, net_name, params, on_progress=None):
                 cpoly = octi_pull(cm, li, run)
                 if ri == 0:
                     cpoly = es_pts[:-1] + cpoly
+                cpoly = _octi_cleanup(cm, li, cpoly)
                 ns = neck if ri == 0 else width
                 segments += build_segments(cpoly, routable[li], width, ns, width)
                 for (i, j) in run:
