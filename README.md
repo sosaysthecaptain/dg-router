@@ -55,18 +55,30 @@ bounding-box center minus half the viewBox size (the viewBox excludes the
 `svg_mm = pcb_mm − plot_origin`, sub-pixel accurate. Pad/track/via geometry
 comes straight from `pcbnew`.
 
+## Routing (headless)
+
+```
+$KPY headless.py board.kicad_pcb --route /RT1 /LCD_BL --solve --layer F.Cu
+```
+Routes each net's DRC gaps with a grid A* on one copper layer, string-pulls the
+path to an any-angle polyline, refills zones, and writes tracks to a COPY at
+`dg-router-out/routed.kicad_pcb` — never your original board. Reports the
+unconnected count before/after; run `kicad-cli pcb drc` to check violations.
+
 ## Roadmap
 
-1. ✅ M0 — plugin shim: install, choices, live net-highlight preview, no-op
-2. S-expr parser + board model (TS core, node v22)
-3. SVG renderer + HTML viewer
-4. Costmap + heatmap overlay
-5. A* core + job spec + writeback
-6. DRC loop + tscircuit fill pass
-7. KiCad IPC (kipy) plugin shim
+1. ✅ M0 — plugin shim: install, choices, live net-highlight preview
+2. ✅ R1 — Python router core: grid A* + string-pull, per-gap routing (so a
+   partial net gets completed, not restarted), obstacle costmap, writes to a
+   COPY, DRC-verified via kicad-cli
+3. DRC-feedback loop: re-route offenders with penalty regions (spec's design)
+4. Vias / multi-layer (currently single-layer only)
+5. Costmap heatmap + before/after diff renders
+6. "Route" button in the plugin (drive from the GUI)
+7. Bulk fill pass (tscircuit capacity-mesh, node) for non-critical nets
 
-Runtime for the TS core is **node** (v22) unless a compelling reason to switch
-to Bun emerges.
+Router core is **Python + pcbnew** (parse/write for free; `kicad-cli` is the
+DRC oracle). A node/tscircuit step comes only for the eventual bulk fill.
 
 ## License
 

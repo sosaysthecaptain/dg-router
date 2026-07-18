@@ -24,6 +24,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
 import pcbnew  # noqa: E402  (embedded interpreter provides this)
 
 import shim  # noqa: E402
+import router  # noqa: E402
 
 
 def main(argv=None):
@@ -38,6 +39,9 @@ def main(argv=None):
     ap.add_argument("--via-cost", type=int, default=80)
     ap.add_argument("--edge-hug", type=float, default=0.0)
     ap.add_argument("--emit", action="store_true", help="write job.json")
+    ap.add_argument("--solve", action="store_true",
+                    help="actually route --route nets, write a copy, DRC-verify")
+    ap.add_argument("--pitch", type=float, default=0.15, help="grid pitch mm")
     ap.add_argument("--out", default=None, help="output dir (default: next to board)")
     args = ap.parse_args(argv)
 
@@ -45,7 +49,7 @@ def main(argv=None):
     out_dir = args.out or os.path.join(os.path.dirname(os.path.abspath(args.board)),
                                        "dg-router-out")
 
-    if args.list or not (args.status or args.render or args.emit):
+    if args.list or not (args.status or args.render or args.emit or args.solve):
         nets = shim.list_nets(board)
         print("copper layers:", ", ".join(shim.copper_layer_names(board)))
         print("nets: %d" % len(nets))
@@ -65,6 +69,23 @@ def main(argv=None):
     if args.render:
         out = os.path.join(out_dir, "preview.svg")
         print("rendered:", shim.render_board_svg(args.board, out))
+
+    if args.solve:
+        if not args.route:
+            ap.error("--solve requires --route NET [NET ...]")
+        before = sum(len(v) for v in shim.drc_unconnected(args.board).values())
+        out = os.path.join(out_dir, "routed.kicad_pcb")
+        params = router.RouteParams(board, pitch_mm=args.pitch)
+        summary = router.solve(args.board, args.route, out,
+                               params=params, prefer_name=args.layer)
+        for r in summary["results"]:
+            print("  %-22s ok=%s  %s" % (
+                r["net"], r["ok"],
+                r.get("reason") or "layer=%s gaps=%d routed=%d"
+                % (r.get("layer", "?"), r.get("gaps", 0), r.get("routed", 0))))
+        after = sum(len(v) for v in shim.drc_unconnected(out).values())
+        print("tracks added: %d" % summary["tracks_added"])
+        print("unconnected: %d -> %d  (wrote %s)" % (before, after, out))
 
     if args.emit:
         job = shim.build_job(
