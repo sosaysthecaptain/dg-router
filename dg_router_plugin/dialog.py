@@ -10,6 +10,7 @@ unrouted (no emoji, no icons).
 """
 
 import os
+import threading
 import traceback
 
 import pcbnew
@@ -25,6 +26,12 @@ _COL_UNROUTED = wx.Colour(140, 140, 140)
 _COL_UNKNOWN = wx.Colour(20, 20, 20)
 _STATUS_COL = {"routed": _COL_ROUTED, "partial": _COL_PARTIAL,
                "unrouted": _COL_UNROUTED}
+_STATUS_WORD = {"routed": "routed", "partial": "partial", "unrouted": "unrouted"}
+
+# native KiCad net colors for highlighting (no board geometry -> nothing left
+# behind). checked nets get a bright color, the active net an even brighter one.
+_HL_CHECKED = (0.10, 0.85, 1.00)   # bright cyan
+_HL_ACTIVE = (1.00, 0.95, 0.25)    # bright yellow
 
 # keep non-modal dialogs alive (prevent GC after Run() returns)
 _OPEN = []
@@ -41,9 +48,14 @@ class RouterDialog(wx.Dialog):
         self.unconn = {}
         self._added = []            # uncommitted preview items in the board
         self._proposed_nets = []
-        self._brightened = []       # copper items brightened for selected net
-        self._rat_shapes = []       # bright ratsnest overlay shapes
+        self._brightened = []       # copper items brightened for highlight
+        self._colored = []          # nets given a temporary net-color
         self._name2code = {n["name"]: n["code"] for n in self.nets}
+        self._netsettings = None
+        try:
+            self._netsettings = board.GetConnectivity().GetNetSettings()
+        except Exception:
+            pass
         self._try_seed = 0
 
         panel = wx.Panel(self)
@@ -53,10 +65,14 @@ class RouterDialog(wx.Dialog):
                             % len(self.nets)), 0, wx.LEFT | wx.TOP, 8)
         self.net_list = wx.ListCtrl(panel, style=wx.LC_REPORT | wx.LC_SINGLE_SEL)
         self.net_list.EnableCheckBoxes(True)
-        self.net_list.InsertColumn(0, "Net", width=320)
+        self.net_list.InsertColumn(0, "Net", width=230)
+        # a WORD column so status is readable even when the row is selected
+        # (the blue selection hides the row text color)
+        self.net_list.InsertColumn(1, "Status", width=88)
         for n in self.nets:
             row = self.net_list.InsertItem(self.net_list.GetItemCount(),
                                            "%s   (%d pads)" % (n["name"], n["pads"]))
+            self.net_list.SetItem(row, 1, "")
             self.net_list.SetItemTextColour(row, _COL_UNKNOWN)
         v.Add(self.net_list, 1, wx.EXPAND | wx.ALL, 8)
 
@@ -123,7 +139,10 @@ class RouterDialog(wx.Dialog):
         self._show_actions(False)
         self._update_route_enabled()
         if self.board.GetFileName():
-            wx.CallAfter(self._load_status)
+            self.status.SetLabel("Loading routing status…")
+            # run the slow DRC off the UI thread so the window is responsive
+            threading.Thread(target=self._status_worker,
+                             args=(self.board.GetFileName(),), daemon=True).start()
         else:
             self.status.SetLabel("Save the board to begin.")
 
@@ -139,26 +158,48 @@ class RouterDialog(wx.Dialog):
 
     def on_check(self, _evt):
         self._update_route_enabled()
+        self._refresh_highlight()
 
     def _apply_status_colors(self):
         for i, n in enumerate(self.nets):
-            self.net_list.SetItemTextColour(
-                i, _STATUS_COL.get(self.status_map.get(n["name"]), _COL_UNKNOWN))
+            st = self.status_map.get(n["name"])
+            self.net_list.SetItemTextColour(i, _STATUS_COL.get(st, _COL_UNKNOWN))
+            self.net_list.SetItem(i, 1, _STATUS_WORD.get(st, ""))
 
-    def _load_status(self):
+    def _status_worker(self, bp):
+        """Runs on a background thread: only the slow kicad-cli DRC."""
         try:
-            status, unconn = shim.net_status_map(self.board,
-                                                 self.board.GetFileName())
+            unconn = shim.drc_unconnected(bp)
         except Exception as e:  # noqa: BLE001
-            self.status.SetLabel("Routing status unavailable: %s" % e)
+            wx.CallAfter(self.status.SetLabel, "Routing status unavailable: %s" % e)
             return
-        self.status_map = status
+        wx.CallAfter(self._status_ready, unconn)
+
+    def _status_ready(self, unconn):
+        """Back on the UI thread: derive per-net status + apply."""
         self.unconn = unconn
+        code_name = {n["code"]: n["name"] for n in self.nets}
+        has_cu = {}
+        for t in self.board.GetTracks():
+            nm = code_name.get(t.GetNetCode())
+            if nm:
+                has_cu[nm] = True
+        self.status_map = {}
+        for n in self.nets:
+            if n["pads"] < 2:
+                continue
+            name = n["name"]
+            if len(unconn.get(name, [])) == 0:
+                self.status_map[name] = "routed"
+            elif has_cu.get(name):
+                self.status_map[name] = "partial"
+            else:
+                self.status_map[name] = "unrouted"
         self._apply_status_colors()
         self._loaded = True
         self._update_route_enabled()
         c = {"routed": 0, "partial": 0, "unrouted": 0}
-        for x in status.values():
+        for x in self.status_map.values():
             c[x] += 1
         self.status.SetLabel("%d routed  %d partial  %d unrouted"
                              % (c["routed"], c["partial"], c["unrouted"]))
@@ -206,71 +247,64 @@ class RouterDialog(wx.Dialog):
         except Exception:
             pass
 
+    def _color_net(self, name, rgb):
+        """Assign a native KiCad net color (colors copper + ratsnest). No board
+        geometry is added, so nothing is left behind."""
+        if self._netsettings is None:
+            return
+        try:
+            self._netsettings.SetNetColorAssignment(
+                name, pcbnew.COLOR4D(rgb[0], rgb[1], rgb[2], 1.0))
+            self._colored.append(name)
+        except Exception:
+            pass
+
+    def _brighten_net(self, name):
+        code = self._name2code.get(name)
+        if code is None:
+            return
+        for it in list(self.board.GetPads()) + list(self.board.GetTracks()):
+            if it.GetNetCode() == code:
+                it.SetBrightened()
+                self._brightened.append(it)
+
     def _clear_highlight(self):
         for it in self._brightened:
             try:
                 it.ClearBrightened()
             except Exception:
                 pass
-        for s in self._rat_shapes:
-            try:
-                self.board.Remove(s)
-            except Exception:
-                pass
         self._brightened = []
-        self._rat_shapes = []
-
-    def _draw_ratsnest(self, name):
-        """Draw the selected net's remaining connections as BRIGHT lines on
-        Dwgs.User, so they stand out far more than KiCad's default airwires."""
-        gaps = self.unconn.get(name, [])
-        if not gaps:
-            return
-        layer = self.board.GetLayerID("Dwgs.User")
-        seg = getattr(pcbnew, "SHAPE_T_SEGMENT", None)
-        try:
-            col = pcbnew.COLOR4D(1.0, 0.24, 0.80, 1.0)   # bright magenta
-        except Exception:
-            col = None
-        w = int(0.15 * 1e6)
-        for (x1, y1, x2, y2) in gaps:
-            s = pcbnew.PCB_SHAPE(self.board)
-            if seg is not None:
-                s.SetShape(seg)
-            s.SetStart(pcbnew.VECTOR2I(int(x1 * 1e6), int(y1 * 1e6)))
-            s.SetEnd(pcbnew.VECTOR2I(int(x2 * 1e6), int(y2 * 1e6)))
-            s.SetWidth(w)
-            s.SetLayer(layer)
-            if col is not None:
-                try:
-                    s.SetLineColor(col)
+        if self._netsettings is not None:
+            for name in self._colored:
+                try:  # reset just OUR nets (don't nuke the user's net colors)
+                    self._netsettings.SetNetColorAssignment(
+                        name, pcbnew.COLOR4D(0, 0, 0, 0))
                 except Exception:
                     pass
-            s.SetBrightened()
-            self.board.Add(s)
-            self._rat_shapes.append(s)
+        self._colored = []
 
-    def on_select(self, evt):
-        """Highlight the clicked net in KiCad: brighten its copper AND draw its
-        remaining ratsnest bright."""
-        idx = evt.GetIndex()
+    def _refresh_highlight(self):
+        """Highlight all CHECKED nets brightly and the ACTIVE (selected) net even
+        brighter, using native net colors + copper brightening."""
         self._clear_highlight()
-        name = self.nets[idx]["name"]
-        code = self._name2code.get(name)
-        if code is not None:
-            for pad in self.board.GetPads():
-                if pad.GetNetCode() == code:
-                    pad.SetBrightened()
-                    self._brightened.append(pad)
-            for t in self.board.GetTracks():
-                if t.GetNetCode() == code:
-                    t.SetBrightened()
-                    self._brightened.append(t)
-        self._draw_ratsnest(name)
-        try:
-            pcbnew.Refresh()
-        except Exception:
-            pass
+        checked = set(self._checked_names())
+        active = None
+        sel = self.net_list.GetFirstSelected()
+        if sel != -1:
+            active = self.nets[sel]["name"]
+        for name in checked:
+            if name == active:
+                continue
+            self._color_net(name, _HL_CHECKED)
+            self._brighten_net(name)
+        if active:
+            self._color_net(active, _HL_ACTIVE)   # even brighter than checked
+            self._brighten_net(active)
+        self._refresh_canvas()
+
+    def on_select(self, _evt):
+        self._refresh_highlight()
 
     # --- routing (drawn into KiCad) ----------------------------------------
 
@@ -309,6 +343,19 @@ class RouterDialog(wx.Dialog):
 
         seg = sum(len(r.get("segments", [])) for r in results)
         via = sum(len(r.get("vias", [])) for r in results)
+        if seg == 0 and via == 0:
+            # nothing routed — say WHY, keep the nets highlighted, stay on Route
+            reasons = []
+            for r in results:
+                if not r.get("ok"):
+                    reasons.append("%s: %s" % (r["net"], r.get("reason") or
+                                               "no clear path (try more layers / "
+                                               "higher via cost)"))
+            self.status.SetLabel("Couldn't route — " + "; ".join(reasons[:3]))
+            self._refresh_highlight()
+            self._show_actions(False)
+            return
+
         incomplete = sum(1 for r in results if not r.get("ok"))
         msg = "Proposed %d tracks, %d vias" % (seg, via)
         if incomplete:

@@ -244,14 +244,23 @@ def drc_unconnected(board_path):
     if not cli:
         raise RuntimeError("kicad-cli not found")
     import tempfile
-    out = os.path.join(tempfile.gettempdir(), "dg-router-drc.json")
-    # Nonzero exit just means violations exist; we parse the report regardless.
-    subprocess.run([cli, "pcb", "drc", "--format", "json", "-o", out, board_path],
-                   capture_output=True, text=True)
-    if not os.path.exists(out):
-        return {}
-    with open(out) as f:
-        data = json.load(f)
+    # unique temp file per call — a fixed path collides when a background status
+    # thread and a route run concurrently, corrupting the JSON.
+    fd, out = tempfile.mkstemp(suffix="-dg-drc.json")
+    os.close(fd)
+    try:
+        # Nonzero exit just means violations exist; parse the report regardless.
+        subprocess.run([cli, "pcb", "drc", "--format", "json", "-o", out,
+                        board_path], capture_output=True, text=True)
+        if not os.path.getsize(out):
+            return {}
+        with open(out) as f:
+            data = json.load(f)
+    finally:
+        try:
+            os.remove(out)
+        except OSError:
+            pass
 
     res = {}
     for item in data.get("unconnected_items", []):
