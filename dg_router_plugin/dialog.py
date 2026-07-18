@@ -402,24 +402,17 @@ class RouterDialog(wx.Dialog):
         params = router.RouteParams(self.board)
         unconn = self.preview.unconn if self.preview.status_loaded \
             else shim.drc_unconnected(bp)
-        prefer = self.layer_choice.GetStringSelection()
+        results = router.route_batch(self.board, names, unconn, params)
         added, done, failed = 0, [], []
-        for name in names:
-            gaps = unconn.get(name, [])
-            if not gaps:
-                done.append((name, "already routed"))
-                continue
-            r = router.route_net(self.board, name, gaps, params, prefer)
-            segs = r.get("segments")
-            if segs:
-                added += router.write_segments(
-                    self.board, r["net_code"], r["layer_id"], segs)
+        for r in results:
+            if r.get("segments") or r.get("vias"):
+                added += router.write_result(self.board, r["net_code"], r)
             if r.get("ok"):
-                done.append((name, "layer %s" % r.get("layer")))
+                done.append((r["net"], "ok"))
             else:
-                reason = r.get("reason") or \
-                    ("routed %d/%d gaps" % (r.get("routed", 0), r.get("gaps", 0)))
-                failed.append((name, reason))
+                failed.append((r["net"], r.get("reason") or
+                               "routed %d/%d gaps" % (r.get("routed", 0),
+                                                      r.get("gaps", 0))))
 
         router.refill_zones(self.board)
         try:

@@ -41,7 +41,11 @@ def main(argv=None):
     ap.add_argument("--emit", action="store_true", help="write job.json")
     ap.add_argument("--solve", action="store_true",
                     help="actually route --route nets, write a copy, DRC-verify")
-    ap.add_argument("--pitch", type=float, default=0.15, help="grid pitch mm")
+    ap.add_argument("--pitch", type=float, default=0.2, help="grid pitch mm")
+    ap.add_argument("--route-via-cost", type=float, default=25.0,
+                    help="A* cost (grid steps) per via")
+    ap.add_argument("--layers", default="F.Cu,B.Cu",
+                    help="comma-separated routable copper layers")
     ap.add_argument("--out", default=None, help="output dir (default: next to board)")
     args = ap.parse_args(argv)
 
@@ -75,9 +79,10 @@ def main(argv=None):
             ap.error("--solve requires --route NET [NET ...]")
         before = sum(len(v) for v in shim.drc_unconnected(args.board).values())
         out = os.path.join(out_dir, "routed.kicad_pcb")
-        params = router.RouteParams(board, pitch_mm=args.pitch)
-        summary = router.solve(args.board, args.route, out,
-                               params=params, prefer_name=args.layer)
+        params = router.RouteParams(
+            board, pitch_mm=args.pitch, via_cost=args.route_via_cost,
+            layer_names=[s.strip() for s in args.layers.split(",") if s.strip()])
+        summary = router.solve(args.board, args.route, out, params=params)
         for r in summary["results"]:
             print("  %-22s ok=%s  %s" % (
                 r["net"], r["ok"],
