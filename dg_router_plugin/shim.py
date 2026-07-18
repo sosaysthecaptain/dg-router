@@ -276,6 +276,92 @@ def drc_unconnected(board_path):
     return res
 
 
+def _pad_ref_at(board, net_code, x, y):
+    """'REF.PADNAME' of the net's pad nearest (x,y) — a stable connection id."""
+    best, bd = None, 1e18
+    for pad in board.GetPads():
+        if pad.GetNetCode() != net_code:
+            continue
+        p = pad.GetPosition()
+        d = (p.x / _NM - x) ** 2 + (p.y / _NM - y) ** 2
+        if d < bd:
+            bd = d
+            fp = pad.GetParentFootprint()
+            ref = fp.GetReference() if fp else "?"
+            best = "%s.%s" % (ref, pad.GetPadName())
+    return best or "?"
+
+
+def net_connections(board, net_name, unconn):
+    """The addressable connections (missing pad-pairs) of one net.
+
+    Returns [{'id','a','b','gap','length'}] where id like 'U5.1:C12.2', a/b are
+    pad refs, gap is (x1,y1,x2,y2) mm. This is the atom a *job* is built from:
+    the GUI resolves a clicked ratline to one of these; the CLI resolves a
+    --connect A:B to one of these. Both route the same gap.
+    """
+    net = None
+    for code in range(1, board.GetNetCount()):
+        n = board.FindNet(code)
+        if n is not None and n.GetNetname() == net_name:
+            net = n
+            break
+    if net is None:
+        return []
+    code = net.GetNetCode()
+    out = []
+    for (x1, y1, x2, y2) in unconn.get(net_name, []):
+        a = _pad_ref_at(board, code, x1, y1)
+        b = _pad_ref_at(board, code, x2, y2)
+        out.append({"id": "%s:%s" % (a, b), "a": a, "b": b,
+                    "gap": (x1, y1, x2, y2),
+                    "length": math.hypot(x2 - x1, y2 - y1)})
+    return out
+
+
+def net_of_pad_ref(board, ref):
+    """Net name owning pad 'REF.PADNAME', or None."""
+    if "." not in ref:
+        return None
+    fpref, padname = ref.rsplit(".", 1)
+    fp = board.FindFootprintByReference(fpref)
+    if fp is None:
+        return None
+    for pad in fp.Pads():
+        if pad.GetPadName() == padname:
+            return pad.GetNetname() or None
+    return None
+
+
+def connections_to_unconn(board, board_path, conn_ids, unconn=None):
+    """Resolve ['U5.1:C12.2', ...] into a {net: [gaps]} subset for solve().
+    A connection matches regardless of endpoint order. Unknown ids are skipped
+    (returned in `missing`)."""
+    if unconn is None:
+        unconn = drc_unconnected(board_path)
+    # index every net's connections once
+    by_net = {}
+    sub, missing = {}, []
+    for cid in conn_ids:
+        parts = cid.split(":")
+        if len(parts) != 2:
+            missing.append(cid)
+            continue
+        nm = net_of_pad_ref(board, parts[0]) or net_of_pad_ref(board, parts[1])
+        if nm is None:
+            missing.append(cid)
+            continue
+        if nm not in by_net:
+            by_net[nm] = net_connections(board, nm, unconn)
+        want = {parts[0], parts[1]}
+        hit = next((c for c in by_net[nm] if {c["a"], c["b"]} == want), None)
+        if hit is None:
+            missing.append(cid)
+            continue
+        sub.setdefault(nm, []).append(hit["gap"])
+    return sub, missing
+
+
 def net_status_map(board, board_path):
     """Per-net routing status + the missing-connection ratsnest.
 

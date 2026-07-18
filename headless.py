@@ -37,6 +37,13 @@ def main(argv=None):
     ap.add_argument("--render-png", dest="render_png", default=None,
                     help="emit a 2D PNG render (readable by Claude)")
     ap.add_argument("--route", nargs="*", default=[], help="net names to route")
+    ap.add_argument("--list-connections", dest="list_connections", nargs="*",
+                    default=None,
+                    help="list a net's addressable connections (pad-pairs); "
+                         "give net names, or omit to use --route nets")
+    ap.add_argument("--connect", nargs="*", default=[],
+                    help="route only these connections, e.g. U5.1:C12.2 "
+                         "(a 'job' of specific pad-pairs); implies --solve")
     ap.add_argument("--layer", default="B.Cu", help="prefer layer")
     ap.add_argument("--via-cost", type=int, default=80)
     ap.add_argument("--edge-hug", type=float, default=0.0)
@@ -59,12 +66,53 @@ def main(argv=None):
                                        "dg-router-out")
 
     if args.list or not (args.status or args.render or args.render_png
-                         or args.emit or args.solve):
+                         or args.emit or args.solve
+                         or args.list_connections is not None or args.connect):
         nets = shim.list_nets(board)
         print("copper layers:", ", ".join(shim.copper_layer_names(board)))
         print("nets: %d" % len(nets))
         for n in nets:
             print("  [%3d] %-28s %d pads" % (n["code"], n["name"], n["pads"]))
+
+    if args.list_connections is not None:
+        nets = args.list_connections or args.route
+        if not nets:
+            ap.error("--list-connections needs net names (or --route nets)")
+        unconn = shim.drc_unconnected(args.board)
+        for nm in nets:
+            conns = shim.net_connections(board, nm, unconn)
+            print("%s: %d connection(s)" % (nm, len(conns)))
+            for c in sorted(conns, key=lambda c: -c["length"]):
+                print("  %-24s %.2f mm" % (c["id"], c["length"]))
+
+    if args.connect:
+        sub, missing = shim.connections_to_unconn(board, args.board, args.connect)
+        if missing:
+            print("unresolved connections: %s" % ", ".join(missing))
+        if not sub:
+            ap.error("no valid --connect connections resolved")
+        before = sum(len(v) for v in shim.drc_unconnected(args.board).values())
+        out = os.path.join(out_dir, "routed.kicad_pcb")
+        params = router.RouteParams(
+            board, pitch_mm=args.pitch, via_cost=args.route_via_cost,
+            layer_names=[s.strip() for s in args.layers.split(",") if s.strip()],
+            objective=args.objective, prefer_layer=args.prefer)
+        summary = router.solve(args.board, None, out, params=params, unconn=sub)
+        for r in summary["results"]:
+            print("  %-22s ok=%s  %s" % (
+                r["net"], r["ok"],
+                r.get("reason") or "gaps=%d routed=%d"
+                % (r.get("gaps", 0), r.get("routed", 0))))
+        import shutil
+        src_pro = os.path.splitext(os.path.abspath(args.board))[0] + ".kicad_pro"
+        if os.path.exists(src_pro):
+            try:
+                shutil.copyfile(src_pro, os.path.join(out_dir, "routed.kicad_pro"))
+            except OSError:
+                pass
+        after = sum(len(v) for v in shim.drc_unconnected(out).values())
+        print("tracks added: %d" % summary["tracks_added"])
+        print("unconnected: %d -> %d  (wrote %s)" % (before, after, out))
 
     if args.status:
         status, unconn = shim.net_status_map(board, args.board)

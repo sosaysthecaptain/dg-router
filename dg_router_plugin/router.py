@@ -1134,11 +1134,19 @@ def route_batch(board, net_names, unconn, params, on_progress=None, on_net=None)
     return results
 
 
-def solve(board_path, net_names, out_path, params=None, prefer_name=None):
+def solve(board_path, net_names, out_path, params=None, prefer_name=None,
+          unconn=None):
+    """Route net_names and write a copy. If `unconn` is given (a
+    {net: [gaps]} subset — e.g. only the connections the user clicked), route
+    exactly those instead of the full ratsnest; net_names may be None to mean
+    'every net in unconn'."""
     import os
     board = pcbnew.LoadBoard(board_path)
     params = params or RouteParams(board)
-    unconn = shim.drc_unconnected(board_path)
+    if unconn is None:
+        unconn = shim.drc_unconnected(board_path)
+    if net_names is None:
+        net_names = list(unconn.keys())
 
     results = route_batch(board, net_names, unconn, params)
     total = 0
