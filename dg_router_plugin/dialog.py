@@ -539,40 +539,7 @@ class RouterDialog(wx.Dialog):
         main = wx.BoxSizer(wx.HORIZONTAL)
         left = wx.BoxSizer(wx.VERTICAL)
 
-        hdr = wx.BoxSizer(wx.HORIZONTAL)
-        hdr.Add(wx.StaticText(panel, label="Nets (%d)" % len(self.nets)),
-                0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 8)
-        self.btn_all = wx.Button(panel, label="All", size=(52, -1))
-        self.btn_none = wx.Button(panel, label="None", size=(60, -1))
-        hdr.AddStretchSpacer(1)
-        hdr.Add(self.btn_all, 0, wx.RIGHT, 4)
-        hdr.Add(self.btn_none, 0)
-        left.Add(hdr, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.TOP, 8)
-
-        self.net_list = wx.ListCtrl(panel, style=wx.LC_REPORT | wx.LC_SINGLE_SEL)
-        self.net_list.EnableCheckBoxes(True)
-        self.net_list.InsertColumn(0, "Net", width=210)
-        self.net_list.InsertColumn(1, "Status", width=84)
-        for n in self.nets:
-            row = self.net_list.InsertItem(self.net_list.GetItemCount(),
-                                           "%s  (%d pads)" % (n["name"], n["pads"]))
-            self.net_list.SetItem(row, 1, "")
-            self.net_list.SetItemTextColour(row, _COL_UNKNOWN)
-        left.Add(self.net_list, 1, wx.EXPAND | wx.ALL, 8)
-
-        lrow = wx.BoxSizer(wx.HORIZONTAL)
-        lrow.Add(wx.StaticText(panel, label="Route on:"),
-                 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 6)
-        self.layer_checks = {}
-        for name in self.layers:
-            cb = wx.CheckBox(panel, label=name)
-            cb.SetValue(name in ("F.Cu", "B.Cu"))
-            self.layer_checks[name] = cb
-            lrow.Add(cb, 0, wx.RIGHT, 6)
-        left.Add(lrow, 0, wx.LEFT | wx.BOTTOM, 8)
-
-        # tool tabs: Route vs Power net (auto-trunk) — separate tools, shared
-        # net list + preview + accept/reject loop
+        # === tabs at the TOP; each tab owns its whole panel ===
         self.tabs = wx.Notebook(panel)
         route_pg = wx.Panel(self.tabs)
         power_pg = wx.Panel(self.tabs)
@@ -580,9 +547,45 @@ class RouterDialog(wx.Dialog):
         self.tabs.AddPage(route_pg, "Route")
         self.tabs.AddPage(power_pg, "Power net")
         self.tabs.AddPage(place_pg, "Place")
-        left.Add(self.tabs, 0, wx.EXPAND | wx.ALL, 8)
+        left.Add(self.tabs, 1, wx.EXPAND | wx.ALL, 8)
 
+        self._obj_keys = ["least_obtrusive", "direct", "follow", "hug"]
+
+        # --- Route tab: nets + routing controls ---
         rp = wx.BoxSizer(wx.VERTICAL)
+        hdr = wx.BoxSizer(wx.HORIZONTAL)
+        hdr.Add(wx.StaticText(route_pg, label="Nets (%d)" % len(self.nets)),
+                0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 8)
+        self.btn_all = wx.Button(route_pg, label="All", size=(52, -1))
+        self.btn_none = wx.Button(route_pg, label="None", size=(60, -1))
+        hdr.AddStretchSpacer(1)
+        hdr.Add(self.btn_all, 0, wx.RIGHT, 4)
+        hdr.Add(self.btn_none, 0)
+        rp.Add(hdr, 0, wx.EXPAND | wx.ALL, 6)
+
+        self.net_list = wx.ListCtrl(route_pg,
+                                    style=wx.LC_REPORT | wx.LC_SINGLE_SEL)
+        self.net_list.EnableCheckBoxes(True)
+        self.net_list.InsertColumn(0, "Net", width=200)
+        self.net_list.InsertColumn(1, "Status", width=80)
+        for n in self.nets:
+            row = self.net_list.InsertItem(self.net_list.GetItemCount(),
+                                           "%s  (%d pads)" % (n["name"], n["pads"]))
+            self.net_list.SetItem(row, 1, "")
+            self.net_list.SetItemTextColour(row, _COL_UNKNOWN)
+        rp.Add(self.net_list, 1, wx.EXPAND | wx.ALL, 6)
+
+        lrow = wx.BoxSizer(wx.HORIZONTAL)
+        lrow.Add(wx.StaticText(route_pg, label="Route on:"),
+                 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 6)
+        self.layer_checks = {}
+        for name in self.layers:
+            cb = wx.CheckBox(route_pg, label=name)
+            cb.SetValue(name in ("F.Cu", "B.Cu"))
+            self.layer_checks[name] = cb
+            lrow.Add(cb, 0, wx.RIGHT, 6)
+        rp.Add(lrow, 0, wx.ALL, 6)
+
         prow = wx.BoxSizer(wx.HORIZONTAL)
         prow.Add(wx.StaticText(route_pg, label="Prefer:"),
                  0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 6)
@@ -591,7 +594,6 @@ class RouterDialog(wx.Dialog):
         prow.Add(self.prefer, 0)
         rp.Add(prow, 0, wx.ALL, 6)
 
-        self._obj_keys = ["least_obtrusive", "direct", "follow", "hug"]
         self.objective = wx.RadioBox(
             route_pg, label="Objective",
             choices=["Least obtrusive", "Direct", "Follow existing", "Hug edges"],
@@ -608,20 +610,29 @@ class RouterDialog(wx.Dialog):
         grid.Add(self.via_cost, 0, wx.EXPAND)
         rp.Add(grid, 0, wx.EXPAND | wx.ALL, 6)
 
+        self.chk_debug = wx.CheckBox(route_pg, label="Debug: show A* search heatmap")
+        rp.Add(self.chk_debug, 0, wx.ALL, 6)
         self.job_label = wx.StaticText(route_pg, label="Job: empty")
-        rp.Add(self.job_label, 0, wx.ALL, 6)
+        rp.Add(self.job_label, 0, wx.LEFT | wx.RIGHT, 6)
         self.btn_route = wx.Button(route_pg, label="Route")
         self.btn_route.SetDefault()
         rp.Add(self.btn_route, 0, wx.EXPAND | wx.ALL, 6)
         route_pg.SetSizer(rp)
 
+        # --- Power net tab: trunk a chosen power/multi-pin net ---
         pp = wx.BoxSizer(wx.VERTICAL)
         pp.Add(wx.StaticText(power_pg, label=(
-            "Route a power/multi-pin net as a trunk (spine) + branches.\n"
-            "Select the net (row or a pad), then Auto-trunk.")),
+            "Route a power / multi-pin net as a trunk (spine) + branches.")),
             0, wx.ALL, 8)
-        self.btn_trunk = wx.Button(power_pg, label="Auto-trunk selected net")
-        pp.Add(self.btn_trunk, 0, wx.EXPAND | wx.ALL, 6)
+        pp.Add(wx.StaticText(power_pg, label="Net:"), 0, wx.LEFT | wx.TOP, 8)
+        self.trunk_net = wx.Choice(power_pg,
+                                   choices=[n["name"] for n in self.nets])
+        if self.nets:
+            self.trunk_net.SetSelection(0)
+        pp.Add(self.trunk_net, 0, wx.EXPAND | wx.ALL, 8)
+        self.btn_trunk = wx.Button(power_pg, label="Auto-trunk this net")
+        pp.Add(self.btn_trunk, 0, wx.EXPAND | wx.ALL, 8)
+        pp.AddStretchSpacer(1)
         power_pg.SetSizer(pp)
 
         # --- Place tab: put unplaced parts near their anchors ---
@@ -629,27 +640,28 @@ class RouterDialog(wx.Dialog):
         plp.Add(wx.StaticText(place_pg, label=(
             "Place unplaced parts near their anchors.\n"
             "Check the parts to place this pass, then Place.")),
-            0, wx.ALL, 6)
+            0, wx.ALL, 8)
         self.place_stage = wx.RadioBox(
             place_pg, label="Stage",
             choices=["Subsystem anchors", "Satellites"],
             majorDimension=1, style=wx.RA_SPECIFY_COLS)
-        plp.Add(self.place_stage, 0, wx.EXPAND | wx.ALL, 6)
-        self.place_list = wx.CheckListBox(place_pg, choices=[])
-        plp.Add(self.place_list, 1, wx.EXPAND | wx.ALL, 6)
+        plp.Add(self.place_stage, 0, wx.EXPAND | wx.ALL, 8)
         prow2 = wx.BoxSizer(wx.HORIZONTAL)
+        prow2.Add(wx.StaticText(place_pg, label="To place this pass:"),
+                  0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 8)
         self.btn_place_all = wx.Button(place_pg, label="All", size=(52, -1))
         self.btn_place_none = wx.Button(place_pg, label="None", size=(60, -1))
+        prow2.AddStretchSpacer(1)
         prow2.Add(self.btn_place_all, 0, wx.RIGHT, 4)
         prow2.Add(self.btn_place_none, 0)
-        plp.Add(prow2, 0, wx.LEFT | wx.BOTTOM, 6)
+        plp.Add(prow2, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.TOP, 8)
+        self.place_list = wx.CheckListBox(place_pg, choices=[])
+        plp.Add(self.place_list, 1, wx.EXPAND | wx.ALL, 8)
         self.btn_place = wx.Button(place_pg, label="Place checked")
-        plp.Add(self.btn_place, 0, wx.EXPAND | wx.ALL, 6)
+        plp.Add(self.btn_place, 0, wx.EXPAND | wx.ALL, 8)
         place_pg.SetSizer(plp)
 
-        self.chk_debug = wx.CheckBox(panel, label="Debug: show A* search heatmap")
-        left.Add(self.chk_debug, 0, wx.LEFT | wx.BOTTOM, 8)
-
+        # === shared action area (applies to whatever the active tab proposed) ===
         self.btn_cancel = wx.Button(panel, label="Cancel")
         left.Add(self.btn_cancel, 0, wx.EXPAND | wx.LEFT | wx.RIGHT, 8)
         self.btn_cancel.Hide()
@@ -676,7 +688,7 @@ class RouterDialog(wx.Dialog):
         self.preview.on_pad_pick = self._on_pad_pick
         self.preview.on_conn_toggle = self._on_conn_toggle
         main.Add(left, 0, wx.EXPAND)
-        main.SetItemMinSize(left, 360, -1)
+        main.SetItemMinSize(left, 380, -1)
         main.Add(self.preview, 1, wx.EXPAND | wx.ALL, 6)
         panel.SetSizer(main)
         self.panel = panel
@@ -765,7 +777,7 @@ class RouterDialog(wx.Dialog):
 
     def _update_route_enabled(self):
         self.btn_route.Enable(self._loaded and bool(self.job))
-        self.btn_trunk.Enable(self._loaded and self._active_name() is not None)
+        self.btn_trunk.Enable(self._loaded and bool(self.nets))
 
     def _checked_names(self):
         return [self.nets[i]["name"] for i in range(self.net_list.GetItemCount())
@@ -948,10 +960,9 @@ class RouterDialog(wx.Dialog):
         threading.Thread(target=worker, daemon=True).start()
 
     def on_trunk(self, _evt):
-        name = self._active_name()
+        name = self.trunk_net.GetStringSelection()
         if not name:
-            wx.MessageBox("Select a net (click its row or a pad) to auto-trunk.",
-                          "dg-router")
+            wx.MessageBox("Pick a net to auto-trunk.", "dg-router")
             return
         bp = self.board.GetFileName()
         if not bp or not os.path.exists(bp):
