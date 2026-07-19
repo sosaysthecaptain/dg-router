@@ -760,7 +760,7 @@ class RouterDialog(wx.Dialog):
         subs_pg = wx.Panel(self.ptabs)
         sats_pg = wx.Panel(self.ptabs)
         self.ptabs.AddPage(anchors_pg, "Anchors")
-        self.ptabs.AddPage(subs_pg, "Subsystems")
+        self.ptabs.AddPage(subs_pg, "Groups")
         self.ptabs.AddPage(sats_pg, "Satellites")
         self.ptabs.SetSelection(1)             # default to Subsystems
         plp.Add(self.ptabs, 1, wx.EXPAND | wx.ALL, 6)
@@ -781,14 +781,15 @@ class RouterDialog(wx.Dialog):
         ap.Add(arow, 0, wx.EXPAND | wx.ALL, 6)
         anchors_pg.SetSizer(ap)
 
-        # Subsystems page
+        # Groups page (every parent that owns parts: subsystems AND connectors/MCU)
         sp = wx.BoxSizer(wx.VERTICAL)
+        self.pile_label = wx.StaticText(subs_pg, label="")
+        sp.Add(self.pile_label, 0, wx.LEFT | wx.TOP | wx.RIGHT, 6)
         self.subsys_list = wx.ListCtrl(subs_pg, style=wx.LC_REPORT)
-        self.subsys_list.InsertColumn(0, "Subsystem", width=272)
-        self.subsys_list.InsertColumn(1, "Size(mm)", width=62)
-        self.subsys_list.InsertColumn(2, "Pins", width=42)
-        self.subsys_list.InsertColumn(3, "Sats", width=38)
-        self.subsys_list.InsertColumn(4, "Placed", width=46)
+        self.subsys_list.InsertColumn(0, "Group", width=210)
+        self.subsys_list.InsertColumn(1, "Kind", width=90)
+        self.subsys_list.InsertColumn(2, "Parts", width=48)
+        self.subsys_list.InsertColumn(3, "In pile", width=54)
         sp.Add(self.subsys_list, 1, wx.EXPAND | wx.ALL, 6)
         srow = wx.BoxSizer(wx.HORIZONTAL)
         self.btn_place_anchor = wx.Button(subs_pg, label="Place anchor")
@@ -819,7 +820,7 @@ class RouterDialog(wx.Dialog):
         # plunk the whole subsystem down as one draggable mass
         sp.Add(wx.StaticLine(subs_pg), 0, wx.EXPAND | wx.ALL, 4)
         self.btn_place_cluster = wx.Button(
-            subs_pg, label="Place whole subsystem (drag into place)")
+            subs_pg, label="Place group (subsystem parks; connector gathers)")
         sp.Add(self.btn_place_cluster, 0,
                wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM | wx.TOP, 6)
         subs_pg.SetSizer(sp)
@@ -1310,6 +1311,7 @@ class RouterDialog(wx.Dialog):
             self._refresh_place_all()
         if sel == 3 and self._loaded:
             self._clear_view_state()        # a stray selection corrupts ratsnest
+            self._ensure_ratsnest_snapshot()  # force the ratsnest layer visible
             self._refresh_nets(regroup=True)
             self._refresh_canvas()
         if sel == 4 and self._loaded:
@@ -1357,14 +1359,24 @@ class RouterDialog(wx.Dialog):
     def _ensure_ratsnest_snapshot(self):
         """Remember the board's ratsnest state the first time we touch it, so we
         can put everything back to normal when the dialog closes — the tool does
-        its thing, then gets out of the way."""
-        if getattr(self, "_ratsnest_snapshot", None) is not None:
-            return
-        snap = {}
-        for fp in self.board.GetFootprints():
-            for i, pad in enumerate(fp.Pads()):
-                snap[(fp.GetReference(), i)] = pad.GetLocalRatsnestVisible()
-        self._ratsnest_snapshot = snap
+        its thing, then gets out of the way. Also force the global ratsnest LAYER
+        on, else per-pad visibility shows nothing at all."""
+        if getattr(self, "_ratsnest_snapshot", None) is None:
+            snap = {}
+            for fp in self.board.GetFootprints():
+                for i, pad in enumerate(fp.Pads()):
+                    snap[(fp.GetReference(), i)] = pad.GetLocalRatsnestVisible()
+            self._ratsnest_snapshot = snap
+            try:
+                self._ratsnest_layer0 = self.board.IsElementVisible(
+                    pcbnew.LAYER_RATSNEST)
+            except Exception:
+                self._ratsnest_layer0 = True
+        # the ratsnest layer must be visible or nothing draws regardless
+        try:
+            self.board.SetElementVisibility(pcbnew.LAYER_RATSNEST, True)
+        except Exception:
+            pass
 
     def _restore_ratsnest(self):
         """Put ratsnest visibility + highlight back exactly as we found them."""
@@ -1378,6 +1390,8 @@ class RouterDialog(wx.Dialog):
                     pad.SetLocalRatsnestVisible(snap[(ref, i)])
         try:
             self.board.ResetNetHighLight()
+            self.board.SetElementVisibility(
+                pcbnew.LAYER_RATSNEST, getattr(self, "_ratsnest_layer0", True))
         except Exception:
             pass
         self._ratsnest_snapshot = None
@@ -1448,6 +1462,7 @@ class RouterDialog(wx.Dialog):
             return
         _, refs, _ = self._net_group_refs[sel]
         self._clear_view_state()
+        self._ensure_ratsnest_snapshot()
         fps = {fp.GetReference(): fp for fp in self.board.GetFootprints()
                if fp.GetReference()}
         codes = []
@@ -1618,33 +1633,34 @@ class RouterDialog(wx.Dialog):
                                  "satellite(s)")
 
     def _refresh_subsystems(self):
-        """Fill the subsystem list (by human name) + the satellite detail."""
+        """Fill the GROUP list — every parent that owns parts (subsystems AND
+        connectors/MCU) — with an honest 'in pile' (stray) count, plus a
+        board-wide pile total. No part is invisible."""
         table = self._place_table()
         self._place_table_cache = table
-        region = placement._board_region(self.board)
-        fps = {fp.GetReference(): fp for fp in self.board.GetFootprints()
-               if fp.GetReference()}
-        subs = sorted((r for r, i in table.items()
-                       if i["type"] == "subsystem_anchor"),
-                      key=lambda r: (table[r].get("name") or r).lower())
+        groups = placement.parents_with_children(table)
         keep = set(self._selected_subsys_refs()) if getattr(
             self, "_subsys_refs", None) else set()
-        self._subsys_refs = subs
+        self._subsys_refs = [g[0] for g in groups]
+        self._group_type = {g[0]: g[2] for g in groups}
+        total_pile = 0
         L = self.subsys_list
         L.DeleteAllItems()
-        for r in subs:
-            info = table[r]
-            fp = fps.get(r)
-            placed = fp is not None and not placement.is_unplaced(fp, region)
-            nm = info.get("name") or info.get("value") or r
-            w, h = placement._fp_size(fp) if fp else (0, 0)
-            row = L.InsertItem(L.GetItemCount(), "%s (%s)" % (r, nm))
-            L.SetItem(row, 1, "%.1f×%.1f" % (w, h))
-            L.SetItem(row, 2, str(placement._connected_pins(fp)) if fp else "0")
-            L.SetItem(row, 3, str(len(placement.satellites_of(table, r))))
-            L.SetItem(row, 4, "yes" if placed else "no")
-            if r in keep:                   # preserve selection across refresh
+        for par, kids, ptype in groups:
+            info = table.get(par, {})
+            nm = info.get("name") or info.get("value") or par
+            stray = len(placement.stragglers_of(self.board, table, par))
+            total_pile += stray
+            kind = "subsystem" if ptype == "subsystem_anchor" else "connector/MCU"
+            row = L.InsertItem(L.GetItemCount(), "%s (%s)" % (par, nm))
+            L.SetItem(row, 1, kind)
+            L.SetItem(row, 2, str(len(kids)))
+            L.SetItem(row, 3, str(stray) if stray else "—")
+            if par in keep:
                 L.Select(row)
+        self.pile_label.SetLabel(
+            "%d parts still in the pile (stray from their group)." % total_pile
+            if total_pile else "All parts are home with their group.")
         self._refresh_sat_detail()
 
     def _selected_subsys_refs(self):
@@ -1739,7 +1755,7 @@ class RouterDialog(wx.Dialog):
     def on_show_subsys_nets(self, _evt):
         refs = self._selected_subsys_refs()
         if not refs:
-            wx.MessageBox("Select a subsystem first.", "dg-router")
+            wx.MessageBox("Select a group first.", "dg-router")
             return
         self._clear_view_state()            # a stray selection corrupts ratsnest
         self._focus_subsystem_nets(refs)
@@ -1787,10 +1803,16 @@ class RouterDialog(wx.Dialog):
     def on_place_cluster(self, _evt):
         refs = self._selected_subsys_refs()
         if not refs:
-            wx.MessageBox("Select a subsystem first.", "dg-router")
+            wx.MessageBox("Select a group first.", "dg-router")
             return
+        ref = refs[0]
         table = self._place_table()
-        prop = placement.place_subsystem_cluster(self.board, table, refs[0])
+        # a connector/MCU group: don't re-park the anchor (you hand-place those)
+        # — just gather its parts around where it already sits.
+        if getattr(self, "_group_type", {}).get(ref) != "subsystem_anchor":
+            self.on_retrieve_stragglers(_evt)
+            return
+        prop = placement.place_subsystem_cluster(self.board, table, ref)
         self._propose_placements(prop, "subsystem", requested=len(prop))
         # show only this subsystem's nets, then select the mass for dragging
         # (focus first so its selection isn't cleared by the net-focus)
@@ -1804,15 +1826,14 @@ class RouterDialog(wx.Dialog):
     def on_retrieve_stragglers(self, _evt):
         refs = self._selected_subsys_refs()
         if not refs:
-            wx.MessageBox("Select a subsystem first.", "dg-router")
+            wx.MessageBox("Select a group first.", "dg-router")
             return
         ref = refs[0]
         region = placement._board_region(self.board)
         fp = self.board.FindFootprintByReference(ref)
         if fp is None or placement.is_unplaced(fp, region):
-            wx.MessageBox("Place %s (the subsystem) first — stragglers are "
-                          "gathered around the anchor's current spot." % ref,
-                          "dg-router")
+            wx.MessageBox("Place %s first — stragglers are gathered around "
+                          "where it currently sits." % ref, "dg-router")
             return
         table = self._place_table()
         strag = placement.stragglers_of(self.board, table, ref)

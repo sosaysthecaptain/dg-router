@@ -167,6 +167,25 @@ def satellites_of(table, subsystem_ref):
                   and subsystem_ref in i.get("parents", []))
 
 
+def parents_with_children(table):
+    """Every parent that owns satellites — subsystem_anchor OR a plain anchor
+    (connector / MCU). This is what the Place tab must group by, so NO part is
+    invisible just because it hangs off a connector instead of a subsystem IC.
+    Returns [(parent_ref, [child_refs], parent_type)] sorted by ref."""
+    kids = {}
+    for r, i in table.items():
+        if i["type"] != "satellite":
+            continue
+        pars = i.get("parents", [])
+        if pars:
+            kids.setdefault(pars[0], []).append(r)
+    out = []
+    for par in sorted(kids):
+        ptype = table.get(par, {}).get("type", "anchor")
+        out.append((par, sorted(kids[par]), ptype))
+    return out
+
+
 def _fp_size(fp):
     """(w, h) in mm of a footprint — its COURTYARD (the real keep-out), which is
     what collision must use. Pad extent badly underestimates connectors/ICs
