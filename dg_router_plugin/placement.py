@@ -103,26 +103,59 @@ def classify(board):
         out[ref] = {"type": t, "parents": parents,
                     "value": fp.GetValue(), "pads": fp.GetPadCount()}
 
-    # human names: anchors/subsystems keep their value; a satellite becomes
-    # "<subsystem> <signal>" from the lowest-fanout net it shares with its parent
+    # --- refine satellite parents + human names ----------------------------
+    # A rail cap (only power rail + GND) belongs to the regulator that SOURCES
+    # that rail — matched by name (+5VP -> "5V-P"). Otherwise a satellite is
+    # named "<subsystem> <signal>" from the most-telling net it shares.
+    def _clean(s):
+        return "".join(c for c in (s or "").upper() if c.isalnum())
+
+    def _is_gnd(n):
+        return "GND" in (n or "").upper() or (n or "").upper() in ("VSS",)
+
+    def _is_rail(n):
+        return bool(n) and (n.lstrip("/").startswith("+")
+                            or _clean(n) in ("3V3", "5V", "12V", "36V", "6V"))
+
+    sub_by_name = {}
+    for r in subs:
+        sub_by_name.setdefault(_clean(fps[r].GetValue()), r)
+
     for ref, info in out.items():
-        if info["type"] != "satellite" or not info["parents"]:
+        if info["type"] != "satellite":
             out[ref]["name"] = info["value"]
             continue
-        par = info["parents"][0]
-        pname = out.get(par, {}).get("value") or par
-        shared = comp_nets[ref] & comp_nets[par]
-        best_nc, best_sz = None, 1e9
-        for nc in shared:
-            if net_size.get(nc, 1e9) < best_sz:
-                best_sz, best_nc = net_size[nc], nc
-        if best_nc is not None and best_sz <= 6:
-            nn = code_name.get(best_nc, "").lstrip("/")
-            short = nn.split("_")[-1] if "_" in nn else nn
-            out[ref]["name"] = ("%s %s" % (pname, short)) if short \
-                else "%s %s" % (pname, info["value"])
-        else:
+        nets = [code_name.get(nc, "") for nc in comp_nets[ref]]
+        non_gnd = sorted([n for n in nets if n and not _is_gnd(n)],
+                         key=lambda n: net_size.get(
+                             next((c for c in comp_nets[ref]
+                                   if code_name.get(c) == n), 0), 1e9))
+        # rail cap -> its regulator, if the rail name matches a subsystem
+        rail = next((n for n in non_gnd if _is_rail(n)
+                     and _clean(n) in sub_by_name
+                     and sub_by_name[_clean(n)] != ref), None)
+        if rail:
+            info["parents"] = [sub_by_name[_clean(rail)]]
+
+        par = info["parents"][0] if info["parents"] else None
+        pname = out.get(par, {}).get("value") if par else None
+        big = any(u in info["value"].lower() for u in ("uf",)) and \
+            not info["value"].lower().startswith(("0.", "1uf", "2.2uf", "4.7uf"))
+        role = "bulk" if (ref[:1].upper() == "C" and big) else \
+               "decoupling" if ref[:1].upper() == "C" else info["value"]
+        # signal net = a chip-specific low-fanout net if any, else the rail
+        sig = next((n for n in non_gnd
+                    if "_" in n and not _is_rail(n)), None)
+        if sig and pname:
+            out[ref]["name"] = "%s %s" % (pname, sig.lstrip("/").split("_")[-1])
+        elif rail:
+            out[ref]["name"] = "%s %s" % (rail.lstrip("/"), role)
+        elif non_gnd:
+            out[ref]["name"] = "%s %s" % (non_gnd[0].lstrip("/"), role)
+        elif pname:
             out[ref]["name"] = "%s %s" % (pname, info["value"])
+        else:
+            out[ref]["name"] = info["value"]
     return out
 
 

@@ -26,11 +26,11 @@ class DgRouterPlugin(pcbnew.ActionPlugin):
         self.dark_icon_file_name = icon
 
     def Run(self):
-        # Reload submodules so edits take effect on "Refresh Plugins" without a
-        # full KiCad restart (Python otherwise keeps the first import cached).
+        # Hot-reload every submodule (dependency order — dialog imports the
+        # others, so reload it LAST) so editing any of them takes effect the next
+        # time you click the toolbar button — no KiCad restart needed.
         import importlib
-        from . import shim, router, dialog
-        importlib.reload(shim)
-        importlib.reload(router)
-        importlib.reload(dialog)
+        from . import shim, router, placement, dialog
+        for mod in (shim, router, placement, dialog):
+            importlib.reload(mod)
         dialog.show_dialog(pcbnew.GetBoard())

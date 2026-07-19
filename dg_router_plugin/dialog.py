@@ -1420,15 +1420,17 @@ class RouterDialog(wx.Dialog):
         d.Destroy()
 
     def on_driving(self, _evt):
+        # show the doc for the ACTIVE tab: Place -> PLACEMENT.md, else DRIVING.md
+        doc = "PLACEMENT.md" if self.tabs.GetSelection() == 2 else "DRIVING.md"
         path = os.path.join(os.path.dirname(os.path.dirname(
-            os.path.realpath(__file__))), "docs", "DRIVING.md")
+            os.path.realpath(__file__))), "docs", doc)
         try:
             with open(path) as f:
                 text = f.read()
         except Exception:
-            text = ("See docs/DRIVING.md in the dg-router repo — the headless "
-                    "CLI (headless.py) is the API for driving from an agent.")
-        self._text_dialog("Agent instructions", text)
+            text = ("See docs/%s in the dg-router repo — headless.py is the CLI "
+                    "for driving this from an agent." % doc)
+        self._text_dialog("Agent instructions — %s" % doc, text)
 
     def on_close(self, _evt):
         if self in _OPEN:
