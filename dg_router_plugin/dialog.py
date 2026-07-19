@@ -778,10 +778,11 @@ class RouterDialog(wx.Dialog):
         # Subsystems page
         sp = wx.BoxSizer(wx.VERTICAL)
         self.subsys_list = wx.ListCtrl(subs_pg, style=wx.LC_REPORT)
-        self.subsys_list.InsertColumn(0, "Subsystem", width=290)
+        self.subsys_list.InsertColumn(0, "Subsystem", width=272)
         self.subsys_list.InsertColumn(1, "Size(mm)", width=62)
-        self.subsys_list.InsertColumn(2, "Sats", width=38)
-        self.subsys_list.InsertColumn(3, "Placed", width=46)
+        self.subsys_list.InsertColumn(2, "Pins", width=42)
+        self.subsys_list.InsertColumn(3, "Sats", width=38)
+        self.subsys_list.InsertColumn(4, "Placed", width=46)
         sp.Add(self.subsys_list, 1, wx.EXPAND | wx.ALL, 6)
         srow = wx.BoxSizer(wx.HORIZONTAL)
         self.btn_place_anchor = wx.Button(subs_pg, label="Place anchor")
@@ -1203,7 +1204,7 @@ class RouterDialog(wx.Dialog):
         szr.GetItem(self.leftp).SetProportion(1 if place else 0)
         self.leftp.SetMaxSize((-1, -1) if place else (400, -1))
         self.panel.Layout()
-        self.SetSize((500 if place else 1040, self.GetSize().height))
+        self.SetSize((520 if place else 1040, self.GetSize().height))
         self.panel.Layout()
         if place and self._loaded:
             self._refresh_place_all()
@@ -1324,8 +1325,9 @@ class RouterDialog(wx.Dialog):
             w, h = placement._fp_size(fp) if fp else (0, 0)
             row = L.InsertItem(L.GetItemCount(), "%s (%s)" % (r, nm))
             L.SetItem(row, 1, "%.1f×%.1f" % (w, h))
-            L.SetItem(row, 2, str(len(placement.satellites_of(table, r))))
-            L.SetItem(row, 3, "yes" if placed else "no")
+            L.SetItem(row, 2, str(placement._connected_pins(fp)) if fp else "0")
+            L.SetItem(row, 3, str(len(placement.satellites_of(table, r))))
+            L.SetItem(row, 4, "yes" if placed else "no")
         self._refresh_sat_detail()
 
     def _selected_subsys_refs(self):

@@ -194,6 +194,27 @@ def _fp_size(fp):
     return (max(xs) - min(xs)) / _NM + 0.4, (max(ys) - min(ys)) / _NM + 0.4
 
 
+def _connected_pins(fp):
+    """How many of a footprint's pads are actually on a net (the pins that must
+    fan out). A 2-pad cap has 2; a buck IC has ~15-20; a fine-pitch QFN many."""
+    return sum(1 for pad in fp.Pads() if pad.GetNetCode() > 0)
+
+
+def _fanout_halo(fp):
+    """Clear ring (mm) a part needs around it for its pins to escape and route.
+    The rule: MORE PINS, and MORE DENSELY packed -> MORE clearance. So it grows
+    with raw connected-pin count (each pin is an escape) AND with pin density
+    (pins per mm of courtyard perimeter — fine pitch needs deeper room to
+    untangle). A 2-pin cap lands ~0.6mm; a buck ~1.4mm; a dense QFN ~3mm."""
+    pins = _connected_pins(fp)
+    if pins <= 0:
+        return 0.3
+    w, h = _fp_size(fp)
+    perim = max(2.0 * (w + h), 1.0)
+    halo = 0.25 + 0.05 * pins + 0.4 * (pins / perim)
+    return round(min(halo, 3.0), 2)
+
+
 def _overlap(ax, ay, aw, ah, bx, by, bw, bh, gap=0.4):
     return (abs(ax - bx) < (aw + bw) / 2.0 + gap and
             abs(ay - by) < (ah + bh) / 2.0 + gap)
@@ -231,7 +252,7 @@ def place_anchors(board, table, reposition=None):
             continue
         w, h = _fp_size(fp)
         p = fp.GetPosition()
-        placed.append([p.x / _NM, p.y / _NM, w, h])
+        placed.append([p.x / _NM, p.y / _NM, w, h, _fanout_halo(fp)])
 
     def is_connector(ref):
         return "".join(c for c in ref if c.isalpha()).upper() in \
@@ -265,11 +286,12 @@ def place_anchors(board, table, reposition=None):
                 tx, ty = cx, ry1 - h / 2.0 - 1.0
         else:
             tx, ty = cx, cy
-        pos = _spiral_free(tx, ty, w, h, placed, region, 1.0)
+        pos = _spiral_free(tx, ty, w, h, placed, region, 1.0,
+                           halo=_fanout_halo(fps[ref]))
         if pos is None:                 # no room — skip rather than overlap
             continue
         proposed[ref] = pos
-        placed.append([pos[0], pos[1], w, h])
+        placed.append([pos[0], pos[1], w, h, _fanout_halo(fps[ref])])
     return proposed
 
 
@@ -313,7 +335,7 @@ def place_subsystems(board, table, reposition=None):
             subsystems.append((ref, info, w, h))
         else:
             if not is_unplaced(fp, region):
-                placed.append([pos[0], pos[1], w, h])
+                placed.append([pos[0], pos[1], w, h, _fanout_halo(fp)])
 
     cn = _component_nets(board)[0]
 
@@ -341,14 +363,15 @@ def place_subsystems(board, table, reposition=None):
         # reserve satellite room by inflating this subsystem's box
         extra = (sat_area.get(ref, 0.0) * 1.4) ** 0.5
         rw, rh = w + extra, h + extra
-        pos = _spiral_free(tx, ty, rw, rh, placed, region, m)
+        hz = _fanout_halo(fps[ref])
+        pos = _spiral_free(tx, ty, rw, rh, placed, region, m, halo=hz)
         if pos is None:                 # reserved box won't fit — try bare chip
-            pos = _spiral_free(tx, ty, w, h, placed, region, m)
+            pos = _spiral_free(tx, ty, w, h, placed, region, m, halo=hz)
             rw, rh = w, h
         if pos is None:                 # truly no room — skip, don't overlap
             continue
         proposed[ref] = pos
-        placed.append([pos[0], pos[1], rw, rh])
+        placed.append([pos[0], pos[1], rw, rh, hz])
     return proposed
 
 
@@ -397,26 +420,30 @@ def place_satellites(board, table, reposition=None):
             continue
         w, h = _fp_size(fp)
         p = fp.GetPosition()
-        placed.append([p.x / _NM, p.y / _NM, w, h])
+        placed.append([p.x / _NM, p.y / _NM, w, h, _fanout_halo(fp)])
 
     proposed = {}
     for ref in sats:
         info = table[ref]
         w, h = _fp_size(fps[ref])
+        hz = _fanout_halo(fps[ref])
         tx, ty = _satellite_target(board, ref, info, fps, cn, net_size, region)
         if tx is None:
             continue
-        pos = _spiral_free(tx, ty, w, h, placed, region, 0.3)
+        pos = _spiral_free(tx, ty, w, h, placed, region, 0.3, halo=hz)
         if pos is None:                 # no room — skip rather than overlap
             continue
         proposed[ref] = pos
-        placed.append([pos[0], pos[1], w, h])
+        placed.append([pos[0], pos[1], w, h, hz])
     return proposed
 
 
-def _spiral_free(tx, ty, w, h, placed, region, m, gap=0.6):
-    """Nearest grid position to (tx,ty) whose box (+gap for fanout room) clears
-    all placed boxes and stays in the board. Expanding-ring search."""
+def _spiral_free(tx, ty, w, h, placed, region, m, halo=0.6):
+    """Nearest grid position to (tx,ty) whose box clears all placed boxes and
+    stays in the board. Expanding-ring search. Each obstacle box is
+    [x,y,w,h,halo]; the gap enforced against it is max(this part's halo, the
+    obstacle's halo) — so the denser/pinnier of the two sets the spacing, which
+    is what leaves room for a chip's pins to fan out."""
     rx0, ry0, rx1, ry1 = region
     step = 1.0
 
@@ -424,8 +451,10 @@ def _spiral_free(tx, ty, w, h, placed, region, m, gap=0.6):
         if not (rx0 + w / 2 + m <= x <= rx1 - w / 2 - m and
                 ry0 + h / 2 + m <= y <= ry1 - h / 2 - m):
             return False
-        for (px, py, pw, ph) in placed:
-            if _overlap(x, y, w, h, px, py, pw, ph, gap):
+        for box in placed:
+            px, py, pw, ph = box[0], box[1], box[2], box[3]
+            phalo = box[4] if len(box) > 4 else 0.6
+            if _overlap(x, y, w, h, px, py, pw, ph, max(halo, phalo)):
                 return False
         return True
 
