@@ -531,17 +531,17 @@ class ComponentTableDialog(wx.Dialog):
         self.on_changed = on_changed
         g = wx.grid.Grid(self)
         self.grid = g
-        g.CreateGrid(0, 6)
-        for i, lbl in enumerate(["Ref", "Name", "Value", "Type", "Parents",
-                                 "Placed"]):
+        g.CreateGrid(0, 7)
+        for i, lbl in enumerate(["Ref", "Name", "Value", "Size (mm)", "Type",
+                                 "Parents", "Placed"]):
             g.SetColLabelValue(i, lbl)
-        for i, w in enumerate((70, 180, 100, 150, 220, 60)):
+        for i, w in enumerate((66, 180, 90, 78, 140, 210, 56)):
             g.SetColSize(i, w)
         g.SetRowLabelSize(0)
         tattr = wx.grid.GridCellAttr()
         tattr.SetEditor(wx.grid.GridCellChoiceEditor(
             ["anchor", "subsystem_anchor", "satellite"], allowOthers=False))
-        g.SetColAttr(3, tattr)
+        g.SetColAttr(4, tattr)
         self._populate()
         g.Bind(wx.grid.EVT_GRID_CELL_CHANGED, self._on_edit)
         s = wx.BoxSizer(wx.VERTICAL)
@@ -577,28 +577,30 @@ class ComponentTableDialog(wx.Dialog):
             info = t[r]
             fp = fps.get(r)
             placed = fp is not None and not placement.is_unplaced(fp, region)
+            w, h = placement._fp_size(fp) if fp else (0, 0)
             g.SetCellValue(i, 0, r)
             g.SetCellValue(i, 1, info.get("name") or "")
             g.SetCellValue(i, 2, info.get("value", ""))
-            g.SetCellValue(i, 3, info["type"])
-            g.SetCellValue(i, 4, ", ".join(info.get("parents", [])))
-            g.SetCellValue(i, 5, "yes" if placed else "no")
-            for c in (0, 2, 5):
+            g.SetCellValue(i, 3, "%.1f×%.1f" % (w, h))
+            g.SetCellValue(i, 4, info["type"])
+            g.SetCellValue(i, 5, ", ".join(info.get("parents", [])))
+            g.SetCellValue(i, 6, "yes" if placed else "no")
+            for c in (0, 2, 3, 6):
                 g.SetReadOnly(i, c, True)
 
     def _on_edit(self, evt):
         r, c = evt.GetRow(), evt.GetCol()
-        if c in (1, 3, 4):
+        if c in (1, 4, 5):
             ref = self._refs[r]
             saved = placement.load_table(self.bp)
             cur = saved.setdefault("components", {}).setdefault(ref, {})
             if c == 1:
                 cur["name"] = self.grid.GetCellValue(r, 1)
-            elif c == 3:
-                cur["type"] = self.grid.GetCellValue(r, 3)
+            elif c == 4:
+                cur["type"] = self.grid.GetCellValue(r, 4)
             else:
                 cur["parents"] = [p.strip() for p in
-                                  self.grid.GetCellValue(r, 4).split(",")
+                                  self.grid.GetCellValue(r, 5).split(",")
                                   if p.strip()]
             placement.save_table(self.bp, saved)
         evt.Skip()
@@ -787,13 +789,6 @@ class RouterDialog(wx.Dialog):
         sp.Add(wx.StaticText(subs_pg, label="Selected subsystem(s):"),
                0, wx.LEFT, 6)
         sp.Add(srow, 0, wx.EXPAND | wx.ALL, 6)
-        brow = wx.BoxSizer(wx.HORIZONTAL)
-        self.btn_place_all_anchors = wx.Button(subs_pg, label="All anchors")
-        self.btn_place_all_sats = wx.Button(subs_pg, label="All satellites")
-        brow.Add(self.btn_place_all_anchors, 1, wx.RIGHT, 6)
-        brow.Add(self.btn_place_all_sats, 1)
-        sp.Add(wx.StaticText(subs_pg, label="All unplaced:"), 0, wx.LEFT, 6)
-        sp.Add(brow, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 6)
         self.sat_label = wx.StaticText(subs_pg, label="Satellites: —")
         sp.Add(self.sat_label, 0, wx.LEFT | wx.RIGHT, 6)
         self.sat_list = wx.ListCtrl(subs_pg, style=wx.LC_REPORT)
@@ -860,8 +855,6 @@ class RouterDialog(wx.Dialog):
         self.btn_cancel.Bind(wx.EVT_BUTTON, self.on_cancel)
         self.btn_place_anchor.Bind(wx.EVT_BUTTON, self.on_place_anchor)
         self.btn_place_sats.Bind(wx.EVT_BUTTON, self.on_place_satellites)
-        self.btn_place_all_anchors.Bind(wx.EVT_BUTTON, self.on_place_all_anchors)
-        self.btn_place_all_sats.Bind(wx.EVT_BUTTON, self.on_place_all_satellites)
         self.btn_anchor_sel.Bind(wx.EVT_BUTTON, self.on_place_anchors_sel)
         self.btn_anchor_all.Bind(wx.EVT_BUTTON, self.on_place_anchors_all)
         self.btn_sat_sel.Bind(wx.EVT_BUTTON, self.on_place_sat_sel)
@@ -1195,10 +1188,14 @@ class RouterDialog(wx.Dialog):
         # happens in KiCad's own canvas (where you also nudge the parts). Routing
         # keeps the preview.
         place = self.tabs.GetSelection() == 2
-        self.panel.GetSizer().Show(self.preview, not place)  # frees its space
-        # on Place the preview is gone, so let the controls fill the full width;
-        # on Route cap the left column so the preview keeps its room
+        szr = self.panel.GetSizer()
+        szr.Show(self.preview, not place)                 # frees its space
+        # on Place: no preview, so the controls fill the width and the window
+        # shrinks to just that; on Route: cap the left column, restore full width
+        szr.GetItem(self.leftp).SetProportion(1 if place else 0)
         self.leftp.SetMaxSize((-1, -1) if place else (400, -1))
+        self.panel.Layout()
+        self.SetSize((560 if place else 1040, self.GetSize().height))
         self.panel.Layout()
         if place and self._loaded:
             self._refresh_place_all()

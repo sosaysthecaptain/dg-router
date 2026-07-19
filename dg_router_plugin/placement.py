@@ -167,7 +167,21 @@ def satellites_of(table, subsystem_ref):
 
 
 def _fp_size(fp):
-    """(w, h) in mm of a footprint, from its pad extent (+ a little)."""
+    """(w, h) in mm of a footprint — its COURTYARD (the real keep-out), which is
+    what collision must use. Pad extent badly underestimates connectors/ICs
+    (their body is much bigger than their pads); the plain bounding box
+    overestimates (includes ref text). Fall back to pad extent if no courtyard."""
+    import pcbnew
+    for layer in (pcbnew.F_Cu, pcbnew.B_Cu):
+        try:
+            cy = fp.GetCourtyard(layer)
+            if cy and not cy.IsEmpty():
+                bb = cy.BBox()
+                w, h = bb.GetWidth() / _NM, bb.GetHeight() / _NM
+                if w > 0.1 and h > 0.1:
+                    return w + 0.3, h + 0.3
+        except Exception:
+            pass
     xs, ys = [], []
     for pad in fp.Pads():
         p = pad.GetPosition()
