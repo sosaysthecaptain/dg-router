@@ -812,24 +812,10 @@ class RouterDialog(wx.Dialog):
             subs_pg, label="Place selected satellite(s)")
         sp.Add(self.btn_place_one, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 6)
 
-        # cluster knobs + park-as-a-mass
+        # plunk the whole subsystem down as one draggable mass
         sp.Add(wx.StaticLine(subs_pg), 0, wx.EXPAND | wx.ALL, 4)
-        sp.Add(wx.StaticText(subs_pg, label="Cluster (previewed at right):"),
-               0, wx.LEFT | wx.TOP, 6)
-        self.knob_sliders = {}
-        for key, lbl in (("compactness", "Compactness"),
-                         ("orderliness", "Orderliness"),
-                         ("min_distance", "Minimal distance")):
-            krow = wx.BoxSizer(wx.HORIZONTAL)
-            krow.Add(wx.StaticText(subs_pg, label=lbl, size=(110, -1)),
-                     0, wx.ALIGN_CENTER_VERTICAL | wx.LEFT, 6)
-            init = int(placement.KNOB_DEFAULTS[key] * 100)
-            sld = wx.Slider(subs_pg, value=init, minValue=0, maxValue=100)
-            self.knob_sliders[key] = sld
-            krow.Add(sld, 1, wx.EXPAND | wx.RIGHT, 6)
-            sp.Add(krow, 0, wx.EXPAND)
         self.btn_place_cluster = wx.Button(
-            subs_pg, label="Place subsystem parked (drag into place)")
+            subs_pg, label="Place whole subsystem (drag into place)")
         sp.Add(self.btn_place_cluster, 0,
                wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM | wx.TOP, 6)
         subs_pg.SetSizer(sp)
@@ -959,8 +945,6 @@ class RouterDialog(wx.Dialog):
         self.btn_place_sats.Bind(wx.EVT_BUTTON, self.on_place_satellites)
         self.btn_show_nets.Bind(wx.EVT_BUTTON, self.on_show_subsys_nets)
         self.btn_place_cluster.Bind(wx.EVT_BUTTON, self.on_place_cluster)
-        for sld in self.knob_sliders.values():
-            sld.Bind(wx.EVT_SLIDER, lambda e: self._preview_cluster())
         self.btn_place_one.Bind(wx.EVT_BUTTON, self.on_place_one_sat)
         self.btn_anchor_sel.Bind(wx.EVT_BUTTON, self.on_place_anchors_sel)
         self.btn_anchor_all.Bind(wx.EVT_BUTTON, self.on_place_anchors_all)
@@ -1319,10 +1303,6 @@ class RouterDialog(wx.Dialog):
         self.panel.Layout()
         if place and self._loaded:
             self._refresh_place_all()
-            if self.ptabs.GetSelection() == 1:
-                self._preview_cluster()     # may widen to show the cluster ghost
-            else:
-                self._show_cluster_preview(False)
         if sel == 3 and self._loaded:
             self._refresh_nets(regroup=True)
         if sel == 4 and self._loaded:
@@ -1331,10 +1311,6 @@ class RouterDialog(wx.Dialog):
     def _on_ptab(self, _evt):
         if self._loaded:
             self._refresh_place_all()
-            if self.ptabs.GetSelection() == 1:
-                self._preview_cluster()
-            else:
-                self._show_cluster_preview(False)
 
     # ---- Nets tab: view/hide ratsnest by subsystem or component ----
     def _net_groups(self):
@@ -1706,7 +1682,6 @@ class RouterDialog(wx.Dialog):
             show.append(r)
             show += placement.satellites_of(table, r)
         self._highlight_footprints(show)
-        self._preview_cluster()
 
     def _highlight_footprints(self, refs):
         """Brighten the given footprints in KiCad's canvas; clears any prior."""
@@ -1757,55 +1732,7 @@ class RouterDialog(wx.Dialog):
         self.status.SetLabel(
             "Showing only %s nets — closes back to normal." % ", ".join(refs))
 
-    # ---- subsystem cluster preview + park-as-a-mass ----
-    def _knob_values(self):
-        return {k: s.GetValue() / 100.0 for k, s in self.knob_sliders.items()}
-
-    def _cluster_boxes(self, proposed):
-        fps = {fp.GetReference(): fp for fp in self.board.GetFootprints()
-               if fp.GetReference()}
-        boxes = []
-        for r, (x, y, deg) in proposed.items():
-            fp = fps.get(r)
-            if not fp:
-                continue
-            w, h = placement._canonical_wh(fp)
-            if int(round(deg)) % 180:
-                w, h = h, w
-            boxes.append({"ref": r, "x": x, "y": y, "w": w, "h": h})
-        return boxes
-
-    def _preview_cluster(self):
-        """Show the selected subsystem's cluster (with the current knobs) as
-        ghost boxes in the preview panel. Only on Place > Subsystems."""
-        if not self._loaded or self.tabs.GetSelection() != 2 or \
-                self.ptabs.GetSelection() != 1:
-            return
-        refs = self._selected_subsys_refs()
-        if not refs:
-            self._show_cluster_preview(False)
-            return
-        table = getattr(self, "_place_table_cache", None) or self._place_table()
-        prop = placement.place_subsystem_cluster(
-            self.board, table, refs[0], knobs=self._knob_values())
-        boxes = self._cluster_boxes(prop)
-        self.preview.set_placements(boxes)
-        if boxes:
-            xs = [b["x"] for b in boxes]
-            ys = [b["y"] for b in boxes]
-            self.preview.zoom_to_bbox(min(xs) - 3, min(ys) - 3,
-                                      max(xs) + 3, max(ys) + 3)
-        self._show_cluster_preview(True)
-
-    def _show_cluster_preview(self, show):
-        szr = self.panel.GetSizer()
-        szr.Show(self.preview, show)
-        szr.GetItem(self.leftp).SetProportion(0 if show else 1)
-        self.leftp.SetMaxSize((440, -1) if show else (-1, -1))
-        self.panel.Layout()
-        self.SetSize((1080 if show else 520, self.GetSize().height))
-        self.panel.Layout()
-
+    # ---- plunk the whole subsystem down as one draggable mass ----
     def _select_footprints(self, refs):
         """Select the given footprints in KiCad so the user can drag them as one
         mass. Best-effort — if it doesn't engage the move tool, they're parked
@@ -1832,13 +1759,12 @@ class RouterDialog(wx.Dialog):
             wx.MessageBox("Select a subsystem first.", "dg-router")
             return
         table = self._place_table()
-        prop = placement.place_subsystem_cluster(
-            self.board, table, refs[0], knobs=self._knob_values())
-        self._propose_placements(prop, "subsystem (parked)", requested=len(prop))
+        prop = placement.place_subsystem_cluster(self.board, table, refs[0])
+        self._propose_placements(prop, "subsystem", requested=len(prop))
         self._select_footprints(list(prop.keys()))
         self._focus_subsystem_nets([refs[0]])
         self.status.SetLabel(
-            "Parked %s + satellites as one selected mass — drag it into place, "
+            "Placed %s + satellites as one selected mass — drag it into place, "
             "tweak, then route." % refs[0])
 
     def on_edit_table(self, _evt):

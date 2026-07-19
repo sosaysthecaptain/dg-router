@@ -461,16 +461,6 @@ def _sat_orientation(fp, netcode, side):
     return base % 360.0
 
 
-KNOB_DEFAULTS = {"compactness": 0.5, "orderliness": 1.0, "min_distance": 0.7}
-
-
-def _knobs(k):
-    d = dict(KNOB_DEFAULTS)
-    if k:
-        d.update({kk: max(0.0, min(1.0, vv)) for kk, vv in k.items() if kk in d})
-    return d
-
-
 def _make_item(ref, fps, deg, want):
     w0, h0 = _canonical_wh(fps[ref])
     w, h = (w0, h0) if int(round(deg)) % 180 == 0 else (h0, w0)
@@ -478,7 +468,7 @@ def _make_item(ref, fps, deg, want):
             "halo": _fanout_halo(fps[ref])}
 
 
-def place_satellites(board, table, reposition=None, knobs=None):
+def place_satellites(board, table, reposition=None):
     """Tidy per-side placement. Each subsystem's passives are grouped by the chip
     EDGE nearest the pin they serve, then laid in a straight, evenly-spaced,
     aligned RANK just off that edge — oriented (in 90deg steps) so the connecting
@@ -524,7 +514,6 @@ def place_satellites(board, table, reposition=None, knobs=None):
         meta[ref] = (par, px, py, nc, side)
         by_parent.setdefault(par, []).append(ref)
 
-    knobs = _knobs(knobs)
     proposed = {}
     for par, refs in by_parent.items():
         pcx, pcy, pw, ph = _fp_box(fps[par])
@@ -541,19 +530,15 @@ def place_satellites(board, table, reposition=None, knobs=None):
                 want = meta[ref][2] if vert else meta[ref][1]
                 items.append(_make_item(ref, fps, deg, want))
             _place_rank(side, items, pcx, pcy, pw, ph, H,
-                        region, obstacles, proposed, knobs)
+                        region, obstacles, proposed)
     return proposed
 
 
-def place_subsystem_cluster(board, table, ref, origin=None, knobs=None,
-                            anchor_deg=None):
-    """Arrange a whole subsystem (anchor `ref` + its satellites) as ONE compact
+def place_subsystem_cluster(board, table, ref, origin=None, anchor_deg=None):
+    """Arrange a whole subsystem (anchor `ref` + its satellites) as ONE tidy
     cluster centered at `origin`=(x,y) mm — independent of where the anchor
-    currently sits. For the 'park it in empty space, then drag the mass to its
-    final spot' workflow. Returns {ref: (x, y, orient_deg)} for the anchor and
-    every placeable satellite. `knobs` = {compactness, orderliness, min_distance}
-    each 0..1."""
-    knobs = _knobs(knobs)
+    currently sits. Plunk the mass down, then drag it into place. Returns
+    {ref: (x, y, orient_deg)} for the anchor and every placeable satellite."""
     region = _board_region(board)
     rx0, ry0, rx1, ry1 = region
     if origin is None:                       # default: park just off the right edge
@@ -615,27 +600,20 @@ def place_subsystem_cluster(board, table, ref, origin=None, knobs=None,
             nc, _, wx_, wy_ = lm[s]
             deg = _sat_orientation(fps[s], nc, side)
             items.append(_make_item(s, fps, deg, wy_ if vert else wx_))
-        _place_rank(side, items, ox, oy, pw, ph, H, big, obstacles, proposed, knobs)
+        _place_rank(side, items, ox, oy, pw, ph, H, big, obstacles, proposed)
     return proposed
 
 
-def _place_rank(side, items, pcx, pcy, pw, ph, H, region, obstacles, proposed,
-                knobs):
-    """Lay one chip edge's satellites in a rank. `items` are pre-built dicts
-    {ref,deg,w,h,want,halo}. Knobs shape it:
-      compactness  -> spacing tightness (gap + halo scale)
-      orderliness  -> along-edge uniformity (0 = hug each pin/ragged, 1 = even)
-      min_distance -> perp closeness to the chip (1 = hug, 0 = pushed out)
+def _place_rank(side, items, pcx, pcy, pw, ph, H, region, obstacles, proposed):
+    """Lay one chip edge's satellites in a straight, aligned, evenly-pitched rank
+    near the pins they serve. `items` are pre-built dicts {ref,deg,w,h,want,halo}.
     Mutates `proposed` (ref -> (x,y,deg)) and `obstacles`."""
     if not items:
         return
     rx0, ry0, rx1, ry1 = region
     vert = side in ("L", "R")
     sign = 1.0 if side in ("R", "B") else -1.0
-    c, o, m = knobs["compactness"], knobs["orderliness"], knobs["min_distance"]
-    gap = 0.45 * (2.0 - 1.6 * c)             # airy .. tight
-    hscale = 1.6 - 0.9 * c
-    Hs = H * hscale
+    gap = 0.45
     items.sort(key=lambda it: it["want"])
     n = len(items)
 
@@ -645,29 +623,18 @@ def _place_rank(side, items, pcx, pcy, pw, ph, H, region, obstacles, proposed,
     def perp(it):
         return it["w"] if vert else it["h"]
 
-    # pin-aligned positions (min pitch enforced both directions)
-    pin = [it["want"] for it in items]
+    # spread along the edge: keep near the pin, enforce min pitch (both directions)
+    pos = [it["want"] for it in items]
     for i in range(1, n):
         need = (along(items[i - 1]) + along(items[i])) / 2.0 + gap
-        pin[i] = max(pin[i], pin[i - 1] + need)
+        pos[i] = max(pos[i], pos[i - 1] + need)
     for i in range(n - 2, -1, -1):
         need = (along(items[i]) + along(items[i + 1])) / 2.0 + gap
-        pin[i] = min(pin[i], pin[i + 1] - need)
-    # evenly distributed, centered on the mean pin coordinate
-    total = sum(along(it) for it in items) + gap * (n - 1)
-    mean = sum(it["want"] for it in items) / n
-    even, cur = [], mean - total / 2.0
-    for it in items:
-        cur += along(it) / 2.0
-        even.append(cur)
-        cur += along(it) / 2.0 + gap
-    # orderliness: 0 -> pin-aligned (ragged), 1 -> evenly spaced (neat)
-    pos = [pin[i] * (1.0 - o) + even[i] * o for i in range(n)]
+        pos[i] = min(pos[i], pos[i + 1] - need)
 
     maxperp = max(perp(it) for it in items)
     phalf = (pw if vert else ph) / 2.0
     base_center = pcx if vert else pcy
-    extra = (1.0 - m) * 3.0                   # min_distance: push out when low
 
     def clears(x, y, it):
         w, h = it["w"], it["h"]
@@ -676,14 +643,14 @@ def _place_rank(side, items, pcx, pcy, pw, ph, H, region, obstacles, proposed,
             return False
         for ob in obstacles:
             if _overlap(x, y, w, h, ob[0], ob[1], ob[2], ob[3],
-                        max(it["halo"] * hscale, ob[4])):
+                        max(it["halo"], ob[4])):
                 return False
         return True
 
     RANKS = 10
     best = None
     for rank_i in range(RANKS):
-        rc = base_center + sign * (phalf + Hs + maxperp / 2.0 + 0.15 + extra +
+        rc = base_center + sign * (phalf + H + maxperp / 2.0 + 0.15 +
                                    rank_i * (maxperp + gap))
         row = []
         for it, a in zip(items, pos):
@@ -698,7 +665,7 @@ def _place_rank(side, items, pcx, pcy, pw, ph, H, region, obstacles, proposed,
     if best:
         for x, y, it in best[2]:
             proposed[it["ref"]] = (x, y, it["deg"])
-            obstacles.append([x, y, it["w"], it["h"], it["halo"] * hscale])
+            obstacles.append([x, y, it["w"], it["h"], it["halo"]])
 
 
 def _spiral_free(tx, ty, w, h, placed, region, m, halo=0.6):
