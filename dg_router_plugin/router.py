@@ -1140,6 +1140,19 @@ def route_net(board, net_name, gaps, params, prior_segments=None,
     net_code = net.GetNetCode()
     routable = params.layer_ids
 
+    # only route connections whose BOTH pads are placed (on the board) — skip any
+    # gap that touches a part still parked off-board
+    bb = board.GetBoardEdgesBoundingBox()
+    _bx0, _by0 = bb.GetX() / _NM, bb.GetY() / _NM
+    _bx1, _by1 = bb.GetRight() / _NM, bb.GetBottom() / _NM
+
+    def _on_board(x, y):
+        return _bx0 <= x <= _bx1 and _by0 <= y <= _by1
+    gaps = [g for g in gaps if _on_board(g[0], g[1]) and _on_board(g[2], g[3])]
+    if not gaps:
+        return {"net": net_name, "ok": False, "reason": "no placed connections",
+                "gaps": 0, "routed": 0, "segments": [], "vias": []}
+
     width, clearance, via_dia, via_drill = params.net_class(net_name)
     edge_m = params.edge_clearance + width / 2.0 + params.pitch
     cm = CostMap(board, routable, net_code, params.pitch, edge_m,

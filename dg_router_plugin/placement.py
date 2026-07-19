@@ -266,6 +266,8 @@ def place_anchors(board, table, reposition=None):
         else:
             tx, ty = cx, cy
         pos = _spiral_free(tx, ty, w, h, placed, region, 1.0)
+        if pos is None:                 # no room — skip rather than overlap
+            continue
         proposed[ref] = pos
         placed.append([pos[0], pos[1], w, h])
     return proposed
@@ -340,6 +342,11 @@ def place_subsystems(board, table, reposition=None):
         extra = (sat_area.get(ref, 0.0) * 1.4) ** 0.5
         rw, rh = w + extra, h + extra
         pos = _spiral_free(tx, ty, rw, rh, placed, region, m)
+        if pos is None:                 # reserved box won't fit — try bare chip
+            pos = _spiral_free(tx, ty, w, h, placed, region, m)
+            rw, rh = w, h
+        if pos is None:                 # truly no room — skip, don't overlap
+            continue
         proposed[ref] = pos
         placed.append([pos[0], pos[1], rw, rh])
     return proposed
@@ -400,6 +407,8 @@ def place_satellites(board, table, reposition=None):
         if tx is None:
             continue
         pos = _spiral_free(tx, ty, w, h, placed, region, 0.3)
+        if pos is None:                 # no room — skip rather than overlap
+            continue
         proposed[ref] = pos
         placed.append([pos[0], pos[1], w, h])
     return proposed
@@ -435,7 +444,7 @@ def _spiral_free(tx, ty, w, h, placed, region, m):
                 if ok(snap(x), snap(y)):
                     return (snap(x), snap(y))
         r += step
-    return (tx, ty)   # give up: stack at target (still previewed for the user)
+    return None   # no free spot anywhere — REJECT (never stack on another part)
 
 
 def sidecar_path(board_path):

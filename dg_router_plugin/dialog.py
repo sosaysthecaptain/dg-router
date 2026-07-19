@@ -535,7 +535,7 @@ class ComponentTableDialog(wx.Dialog):
         for i, lbl in enumerate(["Ref", "Name", "Value", "Size (mm)", "Type",
                                  "Parents", "Placed"]):
             g.SetColLabelValue(i, lbl)
-        for i, w in enumerate((66, 180, 90, 78, 140, 210, 56)):
+        for i, w in enumerate((66, 240, 90, 78, 140, 210, 56)):
             g.SetColSize(i, w)
         g.SetRowLabelSize(0)
         tattr = wx.grid.GridCellAttr()
@@ -778,10 +778,10 @@ class RouterDialog(wx.Dialog):
         # Subsystems page
         sp = wx.BoxSizer(wx.VERTICAL)
         self.subsys_list = wx.ListCtrl(subs_pg, style=wx.LC_REPORT)
-        self.subsys_list.InsertColumn(0, "Subsystem", width=196)
-        self.subsys_list.InsertColumn(1, "Size(mm)", width=66)
-        self.subsys_list.InsertColumn(2, "Sats", width=40)
-        self.subsys_list.InsertColumn(3, "Placed", width=50)
+        self.subsys_list.InsertColumn(0, "Subsystem", width=290)
+        self.subsys_list.InsertColumn(1, "Size(mm)", width=62)
+        self.subsys_list.InsertColumn(2, "Sats", width=38)
+        self.subsys_list.InsertColumn(3, "Placed", width=46)
         sp.Add(self.subsys_list, 1, wx.EXPAND | wx.ALL, 6)
         srow = wx.BoxSizer(wx.HORIZONTAL)
         self.btn_place_anchor = wx.Button(subs_pg, label="Place anchor")
@@ -794,10 +794,10 @@ class RouterDialog(wx.Dialog):
         self.sat_label = wx.StaticText(subs_pg, label="Satellites: —")
         sp.Add(self.sat_label, 0, wx.LEFT | wx.RIGHT, 6)
         self.sat_list = wx.ListCtrl(subs_pg, style=wx.LC_REPORT)
-        self.sat_list.InsertColumn(0, "Ref", width=50)
-        self.sat_list.InsertColumn(1, "Name", width=130)
-        self.sat_list.InsertColumn(2, "Size(mm)", width=64)
-        self.sat_list.InsertColumn(3, "Placed", width=50)
+        self.sat_list.InsertColumn(0, "Ref", width=46)
+        self.sat_list.InsertColumn(1, "Name", width=210)
+        self.sat_list.InsertColumn(2, "Size(mm)", width=62)
+        self.sat_list.InsertColumn(3, "Placed", width=46)
         sp.Add(self.sat_list, 1, wx.EXPAND | wx.ALL, 6)
         subs_pg.SetSizer(sp)
 
@@ -805,11 +805,11 @@ class RouterDialog(wx.Dialog):
         stp = wx.BoxSizer(wx.VERTICAL)
         self.allsat_list = wx.ListCtrl(sats_pg,
                                        style=wx.LC_REPORT)
-        self.allsat_list.InsertColumn(0, "Ref", width=48)
-        self.allsat_list.InsertColumn(1, "Name", width=140)
-        self.allsat_list.InsertColumn(2, "Subsystem", width=80)
-        self.allsat_list.InsertColumn(3, "Size(mm)", width=60)
-        self.allsat_list.InsertColumn(4, "Placed", width=50)
+        self.allsat_list.InsertColumn(0, "Ref", width=44)
+        self.allsat_list.InsertColumn(1, "Name", width=210)
+        self.allsat_list.InsertColumn(2, "Subsystem", width=90)
+        self.allsat_list.InsertColumn(3, "Size(mm)", width=58)
+        self.allsat_list.InsertColumn(4, "Placed", width=44)
         stp.Add(self.allsat_list, 1, wx.EXPAND | wx.ALL, 6)
         strow = wx.BoxSizer(wx.HORIZONTAL)
         self.btn_sat_sel = wx.Button(sats_pg, label="Place selected")
@@ -1199,7 +1199,7 @@ class RouterDialog(wx.Dialog):
         szr.GetItem(self.leftp).SetProportion(1 if place else 0)
         self.leftp.SetMaxSize((-1, -1) if place else (400, -1))
         self.panel.Layout()
-        self.SetSize((560 if place else 1040, self.GetSize().height))
+        self.SetSize((660 if place else 1040, self.GetSize().height))
         self.panel.Layout()
         if place and self._loaded:
             self._refresh_place_all()
@@ -1276,7 +1276,7 @@ class RouterDialog(wx.Dialog):
         self._propose_placements(
             {r: xy for r, xy in placement.place_anchors(
                 self.board, t, reposition=refs).items() if r in refs},
-            "anchor(s)")
+            "anchor(s)", requested=len(refs))
 
     def on_place_anchors_all(self, _evt):
         t = self._place_table()
@@ -1292,7 +1292,7 @@ class RouterDialog(wx.Dialog):
         self._propose_placements(
             {r: xy for r, xy in placement.place_satellites(
                 self.board, t, reposition=refs).items() if r in refs},
-            "satellite(s)")
+            "satellite(s)", requested=len(refs))
 
     def on_place_sat_all(self, _evt):
         t = self._place_table()
@@ -1376,12 +1376,13 @@ class RouterDialog(wx.Dialog):
         self._refresh_place_all()
         self.status.SetLabel("Re-inferred subsystems (overrides cleared).")
 
-    def _propose_placements(self, proposed, what):
+    def _propose_placements(self, proposed, what, requested=None):
         """Place directly into KiCad (no ghost/accept) — you tweak in the canvas,
-        then place the next. Remembers prior positions so 'Undo' can restore."""
+        then place the next. Remembers prior positions so 'Undo' can restore.
+        Parts with no free spot are REJECTED (never stacked); report how many."""
         if not proposed:
-            wx.MessageBox("Nothing to place — place the subsystem's anchor "
-                          "first, then its satellites.", "dg-router")
+            wx.MessageBox("No room to place without overlapping — free up space "
+                          "or place fewer at a time.", "dg-router")
             return
         _NM = 1e6
         try:
@@ -1404,8 +1405,12 @@ class RouterDialog(wx.Dialog):
                               "%s\n\n%s" % (e, traceback.format_exc()))
             return
         self.btn_undo_place.Enable(bool(self._undo_positions))
-        self.status.SetLabel("Placed %d %s in KiCad — nudge there, then place the "
-                             "next (Cmd+S to save; or Undo)." % (n, what))
+        msg = "Placed %d %s in KiCad — nudge there, then place the next." % (n, what)
+        if requested and requested > n:
+            msg = ("Placed %d of %d %s (%d had no room — freed nothing, never "
+                   "stacked). " % (n, requested, what, requested - n)) + \
+                "Nudge/free space, then retry."
+        self.status.SetLabel(msg)
 
     def on_undo_place(self, _evt):
         for ref, (x, y) in self._undo_positions.items():
@@ -1427,7 +1432,7 @@ class RouterDialog(wx.Dialog):
         table = self._place_table()
         proposed = {r: xy for r, xy in placement.place_subsystems(
             self.board, table, reposition=refs).items() if r in refs}
-        self._propose_placements(proposed, "anchor(s)")
+        self._propose_placements(proposed, "anchor(s)", requested=len(refs))
 
     def on_place_satellites(self, _evt):
         refs = self._selected_subsys_refs()
@@ -1440,7 +1445,7 @@ class RouterDialog(wx.Dialog):
             want.update(placement.satellites_of(table, r))
         proposed = {r: xy for r, xy in placement.place_satellites(
             self.board, table, reposition=want).items() if r in want}
-        self._propose_placements(proposed, "satellite(s)")
+        self._propose_placements(proposed, "satellite(s)", requested=len(want))
 
     def on_place_all_anchors(self, _evt):
         table = self._place_table()
