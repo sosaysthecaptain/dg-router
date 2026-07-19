@@ -26,6 +26,7 @@ import wx.grid
 from . import shim
 from . import router
 from . import placement
+from . import bom
 
 # overlay colors
 _C_PAD = wx.Colour(255, 235, 59)
@@ -643,10 +644,12 @@ class RouterDialog(wx.Dialog):
         power_pg = wx.Panel(self.tabs)
         place_pg = wx.Panel(self.tabs)
         nets_pg = wx.Panel(self.tabs)
+        bom_pg = wx.Panel(self.tabs)
         self.tabs.AddPage(route_pg, "Route")
         self.tabs.AddPage(power_pg, "Power net")
         self.tabs.AddPage(place_pg, "Place")
         self.tabs.AddPage(nets_pg, "Nets")
+        self.tabs.AddPage(bom_pg, "BoM")
         left.Add(self.tabs, 1, wx.EXPAND | wx.ALL, 8)
 
         self._obj_keys = ["least_obtrusive", "direct", "follow", "hug"]
@@ -886,6 +889,34 @@ class RouterDialog(wx.Dialog):
         np.Add(hlrow, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 6)
         nets_pg.SetSizer(np)
 
+        # --- BoM tab: JLC BoM + CPL export ---
+        bp = wx.BoxSizer(wx.VERTICAL)
+        bp.Add(wx.StaticText(bom_pg, label=(
+            "JLC PCBA export. LCSC part #s + rotation fixes live in "
+            "<board>.dg-bom.json (edit by hand or via Claude), then Reload.")),
+            0, wx.ALL, 6)
+        brow = wx.BoxSizer(wx.HORIZONTAL)
+        self.btn_bom_reload = wx.Button(bom_pg, label="Reload")
+        self.btn_bom_csv = wx.Button(bom_pg, label="Export BoM CSV")
+        self.btn_cpl_csv = wx.Button(bom_pg, label="Export CPL CSV")
+        brow.Add(self.btn_bom_reload, 0, wx.RIGHT, 6)
+        brow.AddStretchSpacer(1)
+        brow.Add(self.btn_bom_csv, 0, wx.RIGHT, 6)
+        brow.Add(self.btn_cpl_csv, 0)
+        bp.Add(brow, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 6)
+
+        self.bom_status = wx.StaticText(bom_pg, label="")
+        bp.Add(self.bom_status, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 6)
+
+        self.bom_list = wx.ListCtrl(bom_pg, style=wx.LC_REPORT)
+        self.bom_list.InsertColumn(0, "Comment", width=120)
+        self.bom_list.InsertColumn(1, "Qty", width=40)
+        self.bom_list.InsertColumn(2, "LCSC", width=90)
+        self.bom_list.InsertColumn(3, "Footprint", width=180)
+        self.bom_list.InsertColumn(4, "Designators", width=260)
+        bp.Add(self.bom_list, 1, wx.EXPAND | wx.ALL, 6)
+        bom_pg.SetSizer(bp)
+
         # === shared action area (applies to whatever the active tab proposed) ===
         self.btn_cancel = wx.Button(leftp, label="Cancel")
         left.Add(self.btn_cancel, 0, wx.EXPAND | wx.LEFT | wx.RIGHT, 8)
@@ -956,6 +987,9 @@ class RouterDialog(wx.Dialog):
         self.net_group_list.Bind(wx.EVT_LIST_ITEM_UNCHECKED, self._on_net_check)
         self.btn_net_hl.Bind(wx.EVT_BUTTON, self.on_net_highlight)
         self.btn_net_clearhl.Bind(wx.EVT_BUTTON, self.on_net_clear_highlight)
+        self.btn_bom_reload.Bind(wx.EVT_BUTTON, lambda e: self._refresh_bom())
+        self.btn_bom_csv.Bind(wx.EVT_BUTTON, self.on_export_bom)
+        self.btn_cpl_csv.Bind(wx.EVT_BUTTON, self.on_export_cpl)
         self.btn_claude.Bind(wx.EVT_BUTTON, self.on_driving)
         self.net_list.Bind(wx.EVT_LIST_ITEM_SELECTED, self.on_select)
         self.net_list.Bind(wx.EVT_LIST_ITEM_CHECKED, self.on_net_checked)
@@ -1273,7 +1307,7 @@ class RouterDialog(wx.Dialog):
         # keeps the preview.
         sel = self.tabs.GetSelection()
         place = sel == 2
-        slim = sel in (2, 3)                               # Place + Nets: no preview
+        slim = sel in (2, 3, 4)                            # Place/Nets/BoM: no preview
         szr = self.panel.GetSizer()
         szr.Show(self.preview, not slim)                  # frees its space
         # slim tabs: no preview, controls fill the width, window shrinks to it;
@@ -1291,6 +1325,8 @@ class RouterDialog(wx.Dialog):
                 self._show_cluster_preview(False)
         if sel == 3 and self._loaded:
             self._refresh_nets(regroup=True)
+        if sel == 4 and self._loaded:
+            self._refresh_bom()
 
     def _on_ptab(self, _evt):
         if self._loaded:
@@ -1454,6 +1490,55 @@ class RouterDialog(wx.Dialog):
             pass
         self._refresh_canvas()
         self.status.SetLabel("Cleared net highlight.")
+
+    # ---- BoM tab: JLC BoM + CPL export ----
+    def _refresh_bom(self):
+        path = self.board.GetFileName()
+        try:
+            rows = bom.bom_rows(self.board, path)
+        except Exception as e:  # noqa: BLE001
+            self.bom_status.SetLabel("BoM error: %s" % e)
+            return
+        L = self.bom_list
+        L.DeleteAllItems()
+        missing = 0
+        for r in rows:
+            row = L.InsertItem(L.GetItemCount(), r["comment"])
+            L.SetItem(row, 1, str(r["qty"]))
+            L.SetItem(row, 2, r["lcsc"] or "— MISSING")
+            L.SetItem(row, 3, r["footprint"])
+            L.SetItem(row, 4, r["designators"])
+            if not r["lcsc"]:
+                missing += 1
+        self.bom_status.SetLabel(
+            "%d BoM lines, %d missing an LCSC part #." % (len(rows), missing))
+
+    def _export_csv(self, writer, suffix, label):
+        board_path = self.board.GetFileName()
+        base = (os.path.splitext(os.path.basename(board_path))[0]
+                if board_path else "board")
+        dlg = wx.FileDialog(self, "Export %s CSV" % label,
+                            defaultFile="%s_%s.csv" % (base, suffix),
+                            wildcard="CSV files (*.csv)|*.csv",
+                            style=wx.FD_SAVE | wx.FD_OVERWRITE_PROMPT)
+        if dlg.ShowModal() != wx.ID_OK:
+            dlg.Destroy()
+            return
+        out = dlg.GetPath()
+        dlg.Destroy()
+        try:
+            writer(self.board, board_path, out)
+        except Exception as e:  # noqa: BLE001
+            self._text_dialog("%s export error" % label,
+                              "%s\n\n%s" % (e, traceback.format_exc()))
+            return
+        self.bom_status.SetLabel("Exported %s → %s" % (label, out))
+
+    def on_export_bom(self, _evt):
+        self._export_csv(bom.write_bom_csv, "bom", "BoM")
+
+    def on_export_cpl(self, _evt):
+        self._export_csv(bom.write_cpl_csv, "cpl", "CPL")
 
     def _refresh_place_all(self):
         self._refresh_anchors()
@@ -2036,8 +2121,9 @@ class RouterDialog(wx.Dialog):
         d.Destroy()
 
     def on_driving(self, _evt):
-        # show the doc for the ACTIVE tab: Place -> PLACEMENT.md, else DRIVING.md
-        doc = "PLACEMENT.md" if self.tabs.GetSelection() == 2 else "DRIVING.md"
+        # show the doc for the ACTIVE tab
+        sel = self.tabs.GetSelection()
+        doc = {2: "PLACEMENT.md", 4: "BOM.md"}.get(sel, "DRIVING.md")
         path = os.path.join(os.path.dirname(os.path.dirname(
             os.path.realpath(__file__))), "docs", doc)
         try:

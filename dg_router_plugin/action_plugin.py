@@ -30,7 +30,7 @@ class DgRouterPlugin(pcbnew.ActionPlugin):
         # others, so reload it LAST) so editing any of them takes effect the next
         # time you click the toolbar button — no KiCad restart needed.
         import importlib
-        from . import shim, router, placement, dialog
-        for mod in (shim, router, placement, dialog):
+        from . import shim, router, placement, bom, dialog
+        for mod in (shim, router, placement, bom, dialog):
             importlib.reload(mod)
         dialog.show_dialog(pcbnew.GetBoard())
