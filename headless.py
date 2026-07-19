@@ -51,6 +51,9 @@ def main(argv=None):
                     help="infer component tiers (anchor/subsystem/satellite) + parents")
     ap.add_argument("--classify-write", dest="classify_write", action="store_true",
                     help="write the inferred classification to the sidecar JSON")
+    ap.add_argument("--place-subsystems", dest="place_subsystems",
+                    action="store_true",
+                    help="place unplaced subsystem anchors; write a copy + render")
     ap.add_argument("--layer", default="B.Cu", help="prefer layer")
     ap.add_argument("--via-cost", type=int, default=80)
     ap.add_argument("--edge-hug", type=float, default=0.0)
@@ -75,6 +78,7 @@ def main(argv=None):
     if args.list or not (args.status or args.render or args.render_png
                          or args.emit or args.solve or args.auto_trunk
                          or args.classify or args.classify_write
+                         or args.place_subsystems
                          or args.list_connections is not None or args.connect):
         nets = shim.list_nets(board)
         print("copper layers:", ", ".join(shim.copper_layer_names(board)))
@@ -137,6 +141,28 @@ def main(argv=None):
             out = {"components": {r: {"type": i["type"], "parents": i["parents"]}
                                   for r, i in table.items()}}
             print("wrote:", placement.save_table(args.board, out))
+
+    if args.place_subsystems:
+        table = placement.effective_table(board, args.board)
+        proposed = placement.place_subsystems(board, table)
+        print("placing %d subsystem anchors:" % len(proposed))
+        fps = {fp.GetReference(): fp for fp in board.GetFootprints()
+               if fp.GetReference()}
+        _NM = 1e6
+        for ref, (x, y) in sorted(proposed.items()):
+            fp = fps.get(ref)
+            if fp:
+                fp.SetPosition(pcbnew.VECTOR2I(int(x * _NM), int(y * _NM)))
+                print("  %-6s -> (%.1f, %.1f)" % (ref, x, y))
+        out = os.path.join(out_dir, "placed.kicad_pcb")
+        os.makedirs(out_dir, exist_ok=True)
+        pcbnew.SaveBoard(out, board)
+        png = os.path.join(out_dir, "placed.png")
+        try:
+            shim.render_board_png(out, png)
+            print("render:", png)
+        except Exception as e:  # noqa: BLE001
+            print("render failed:", e)
 
     if args.auto_trunk:
         before = sum(len(v) for v in shim.drc_unconnected(args.board).values())

@@ -97,6 +97,145 @@ def classify(board):
     return out
 
 
+def _fp_size(fp):
+    """(w, h) in mm of a footprint, from its pad extent (+ a little)."""
+    xs, ys = [], []
+    for pad in fp.Pads():
+        p = pad.GetPosition()
+        sz = pad.GetSize()
+        r = max(sz.x, sz.y) / 2.0
+        xs += [p.x - r, p.x + r]
+        ys += [p.y - r, p.y + r]
+    if not xs:
+        return 2.0, 2.0
+    return (max(xs) - min(xs)) / _NM + 0.4, (max(ys) - min(ys)) / _NM + 0.4
+
+
+def _overlap(ax, ay, aw, ah, bx, by, bw, bh, gap=0.4):
+    return (abs(ax - bx) < (aw + bw) / 2.0 + gap and
+            abs(ay - by) < (ah + bh) / 2.0 + gap)
+
+
+def _board_region(board):
+    bb = board.GetBoardEdgesBoundingBox()
+    return (bb.GetX() / _NM, bb.GetY() / _NM,
+            bb.GetRight() / _NM, bb.GetBottom() / _NM)
+
+
+def is_unplaced(fp, region):
+    """A part parked outside the board outline counts as unplaced."""
+    p = fp.GetPosition()
+    return not (region[0] <= p.x / _NM <= region[2] and
+                region[1] <= p.y / _NM <= region[3])
+
+
+def place_subsystems(board, table, reposition=None):
+    """Propose positions for subsystem anchors: each near the anchors it serves,
+    reserving room for its satellites, non-overlapping, snapped to grid.
+
+    Only places parts currently OUTSIDE the board (unplaced), unless their ref is
+    in `reposition` (opt-in to move already-placed parts). Returns {ref: (x,y)}
+    in mm. Does not mutate the board.
+    """
+    reposition = set(reposition or [])
+    region = _board_region(board)
+    rx0, ry0, rx1, ry1 = region
+    m = 2.0
+    fps = {fp.GetReference(): fp for fp in board.GetFootprints()
+           if fp.GetReference()}
+
+    # satellite room per subsystem: rough cluster area of its satellites
+    sat_area = {}
+    for ref, info in table.items():
+        if info["type"] != "satellite":
+            continue
+        for par in info["parents"][:1]:
+            if par in fps:
+                w, h = _fp_size(fps[par])
+                sat_area[par] = sat_area.get(par, 0.0) + w * h
+
+    # obstacles: every placed part (anchors + already-placed subsystems) as boxes
+    placed = []
+    subsystems = []
+    for ref, info in table.items():
+        fp = fps.get(ref)
+        if fp is None:
+            continue
+        w, h = _fp_size(fp)
+        p = fp.GetPosition()
+        pos = (p.x / _NM, p.y / _NM)
+        if info["type"] == "subsystem_anchor" and (
+                is_unplaced(fp, region) or ref in reposition):
+            subsystems.append((ref, info, w, h))
+        else:
+            if not is_unplaced(fp, region):
+                placed.append([pos[0], pos[1], w, h])
+
+    cn = _component_nets(board)[0]
+
+    def anchor_pull(ref):
+        pts = []
+        for par in table[ref]["parents"]:
+            if par in fps and not is_unplaced(fps[par], region):
+                p = fps[par].GetPosition()
+                shared_n = len(cn.get(ref, set()) & cn.get(par, set())) or 1
+                pts.append((p.x / _NM, p.y / _NM, shared_n))
+        return pts
+
+    # most-connected-to-anchors first (they pin the layout)
+    subsystems.sort(key=lambda s: -len(anchor_pull(s[0])))
+
+    proposed = {}
+    for ref, info, w, h in subsystems:
+        pulls = anchor_pull(ref)
+        if pulls:
+            tw = sum(p[2] for p in pulls)
+            tx = sum(p[0] * p[2] for p in pulls) / tw
+            ty = sum(p[1] * p[2] for p in pulls) / tw
+        else:
+            tx, ty = (rx0 + rx1) / 2.0, (ry0 + ry1) / 2.0
+        # reserve satellite room by inflating this subsystem's box
+        extra = (sat_area.get(ref, 0.0) * 1.4) ** 0.5
+        rw, rh = w + extra, h + extra
+        pos = _spiral_free(tx, ty, rw, rh, placed, region, m)
+        proposed[ref] = pos
+        placed.append([pos[0], pos[1], rw, rh])
+    return proposed
+
+
+def _spiral_free(tx, ty, w, h, placed, region, m):
+    """Nearest grid position to (tx,ty) whose reserved box clears all placed
+    boxes and stays in the board. Expanding-ring search."""
+    rx0, ry0, rx1, ry1 = region
+    step = 1.0
+
+    def ok(x, y):
+        if not (rx0 + w / 2 + m <= x <= rx1 - w / 2 - m and
+                ry0 + h / 2 + m <= y <= ry1 - h / 2 - m):
+            return False
+        for (px, py, pw, ph) in placed:
+            if _overlap(x, y, w, h, px, py, pw, ph):
+                return False
+        return True
+
+    def snap(v):
+        return round(v * 2) / 2.0
+
+    tx, ty = snap(tx), snap(ty)
+    if ok(tx, ty):
+        return (tx, ty)
+    r = step
+    while r < max(rx1 - rx0, ry1 - ry0):
+        n = int(r / step)
+        for k in range(-n, n + 1):
+            for (x, y) in ((tx + k * step, ty - r), (tx + k * step, ty + r),
+                           (tx - r, ty + k * step), (tx + r, ty + k * step)):
+                if ok(snap(x), snap(y)):
+                    return (snap(x), snap(y))
+        r += step
+    return (tx, ty)   # give up: stack at target (still previewed for the user)
+
+
 def sidecar_path(board_path):
     return os.path.splitext(os.path.abspath(board_path))[0] + ".dg-place.json"
 
