@@ -609,7 +609,8 @@ class ComponentTableDialog(wx.Dialog):
 class RouterDialog(wx.Dialog):
     def __init__(self, board):
         super().__init__(None, title="dg-router", size=(1040, 760),
-                         style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER)
+                         style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER,
+                         name="dg_router_main")
         self.board = board
         self.nets = [n for n in shim.list_nets(board) if n["pads"] >= 2]
         self.layers = shim.copper_layer_names(board)
@@ -1304,7 +1305,9 @@ class RouterDialog(wx.Dialog):
         if place and self._loaded:
             self._refresh_place_all()
         if sel == 3 and self._loaded:
+            self._clear_view_state()        # a stray selection corrupts ratsnest
             self._refresh_nets(regroup=True)
+            self._refresh_canvas()
         if sel == 4 and self._loaded:
             self._refresh_bom()
 
@@ -1423,6 +1426,7 @@ class RouterDialog(wx.Dialog):
 
     def on_nets_show_all(self, visible):
         self._ensure_ratsnest_snapshot()
+        self._clear_view_state()
         for fp in self.board.GetFootprints():
             for pad in fp.Pads():
                 pad.SetLocalRatsnestVisible(visible)
@@ -1439,6 +1443,7 @@ class RouterDialog(wx.Dialog):
             wx.MessageBox("Select a group row to highlight.", "dg-router")
             return
         _, refs, _ = self._net_group_refs[sel]
+        self._clear_view_state()
         fps = {fp.GetReference(): fp for fp in self.board.GetFootprints()
                if fp.GetReference()}
         codes = []
@@ -1728,29 +1733,47 @@ class RouterDialog(wx.Dialog):
         if not refs:
             wx.MessageBox("Select a subsystem first.", "dg-router")
             return
+        self._clear_view_state()            # a stray selection corrupts ratsnest
         self._focus_subsystem_nets(refs)
         self.status.SetLabel(
             "Showing only %s nets — closes back to normal." % ", ".join(refs))
 
     # ---- plunk the whole subsystem down as one draggable mass ----
+    def _clear_selection(self):
+        """Drop any selection WE set. Selected items force their ratsnest to draw
+        (KiCad's move preview), which corrupts the net show/hide — so this must
+        run before any ratsnest preview and on close."""
+        for fp in self.board.GetFootprints():
+            try:
+                if fp.IsSelected():
+                    fp.ClearSelected()
+            except Exception:
+                pass
+        self._selected_fps = []
+
+    def _clear_view_state(self):
+        """Clear transient view decorations (brighten + selection) so a ratsnest
+        preview starts clean."""
+        self._clear_canvas_highlight()
+        self._clear_selection()
+
     def _select_footprints(self, refs):
         """Select the given footprints in KiCad so the user can drag them as one
         mass. Best-effort — if it doesn't engage the move tool, they're parked
         together off-board and easy to box-select."""
         fps = {fp.GetReference(): fp for fp in self.board.GetFootprints()
                if fp.GetReference()}
-        for fp in self.board.GetFootprints():
-            try:
-                fp.ClearSelected()
-            except Exception:
-                pass
+        self._clear_selection()
+        done = []
         for r in refs:
             fp = fps.get(r)
             if fp:
                 try:
                     fp.SetSelected()
+                    done.append(fp)
                 except Exception:
                     pass
+        self._selected_fps = done
         self._refresh_canvas()
 
     def on_place_cluster(self, _evt):
@@ -1761,11 +1784,14 @@ class RouterDialog(wx.Dialog):
         table = self._place_table()
         prop = placement.place_subsystem_cluster(self.board, table, refs[0])
         self._propose_placements(prop, "subsystem", requested=len(prop))
-        self._select_footprints(list(prop.keys()))
+        # show only this subsystem's nets, then select the mass for dragging
+        # (focus first so its selection isn't cleared by the net-focus)
+        self._clear_canvas_highlight()
         self._focus_subsystem_nets([refs[0]])
+        self._select_footprints(list(prop.keys()))
         self.status.SetLabel(
-            "Placed %s + satellites as one selected mass — drag it into place, "
-            "tweak, then route." % refs[0])
+            "Placed %s + satellites as one selected mass (its nets shown) — "
+            "drag it into place, tweak, then route." % refs[0])
 
     def on_edit_table(self, _evt):
         """Open the full component table (Ref/Name/Value/Type/Parents) in a wide
@@ -2063,17 +2089,21 @@ class RouterDialog(wx.Dialog):
     def on_close(self, _evt):
         self._restore_ratsnest()            # leave the board's nets as we found them
         self._clear_canvas_highlight()
+        self._clear_selection()
         if self in _OPEN:
             _OPEN.remove(self)
         self.Destroy()
 
 
 def show_dialog(board):
-    for d in _OPEN:                 # one window only — raise the existing one
+    # one window only. _OPEN is wiped whenever the module hot-reloads, so trust
+    # wx's global top-level window list (survives reload) to find a live one.
+    for w in wx.GetTopLevelWindows():
         try:
-            d.Raise()
-            d.Iconize(False)
-            return
+            if w.GetName() == "dg_router_main" and not w.IsBeingDeleted():
+                w.Raise()
+                w.Iconize(False)
+                return
         except Exception:
             pass
     dlg = RouterDialog(board)
