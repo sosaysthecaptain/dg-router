@@ -198,6 +198,65 @@ def is_unplaced(fp, region):
                 region[1] <= p.y / _NM <= region[3])
 
 
+def place_anchors(board, table, reposition=None):
+    """Propose positions for unplaced anchors: connectors snap to the board edge
+    nearest what they connect to; other anchors go central. Simple by design —
+    anchors are usually hand-placed; this is just a starting point to nudge.
+    """
+    reposition = set(reposition or [])
+    region = _board_region(board)
+    rx0, ry0, rx1, ry1 = region
+    fps = {fp.GetReference(): fp for fp in board.GetFootprints()
+           if fp.GetReference()}
+    cn, _, _ = _component_nets(board)
+
+    placed = []
+    for ref, info in table.items():
+        fp = fps.get(ref)
+        if fp is None or is_unplaced(fp, region):
+            continue
+        w, h = _fp_size(fp)
+        p = fp.GetPosition()
+        placed.append([p.x / _NM, p.y / _NM, w, h])
+
+    def is_connector(ref):
+        return "".join(c for c in ref if c.isalpha()).upper() in \
+            ("J", "P", "CN", "X")
+
+    anchors = [r for r, i in table.items() if i["type"] == "anchor"
+               and r in fps and (is_unplaced(fps[r], region) or r in reposition)]
+    proposed = {}
+    for ref in anchors:
+        w, h = _fp_size(fps[ref])
+        # centroid of the placed parts this anchor connects to
+        pts = []
+        for other, ofp in fps.items():
+            if other != ref and not is_unplaced(ofp, region) and \
+                    (cn.get(ref, set()) & cn.get(other, set())):
+                p = ofp.GetPosition()
+                pts.append((p.x / _NM, p.y / _NM))
+        cx = sum(p[0] for p in pts) / len(pts) if pts else (rx0 + rx1) / 2.0
+        cy = sum(p[1] for p in pts) / len(pts) if pts else (ry0 + ry1) / 2.0
+        if is_connector(ref):
+            # snap to the nearest edge
+            d = {"L": cx - rx0, "R": rx1 - cx, "T": cy - ry0, "B": ry1 - cy}
+            side = min(d, key=d.get)
+            if side == "L":
+                tx, ty = rx0 + w / 2.0 + 1.0, cy
+            elif side == "R":
+                tx, ty = rx1 - w / 2.0 - 1.0, cy
+            elif side == "T":
+                tx, ty = cx, ry0 + h / 2.0 + 1.0
+            else:
+                tx, ty = cx, ry1 - h / 2.0 - 1.0
+        else:
+            tx, ty = cx, cy
+        pos = _spiral_free(tx, ty, w, h, placed, region, 1.0)
+        proposed[ref] = pos
+        placed.append([pos[0], pos[1], w, h])
+    return proposed
+
+
 def place_subsystems(board, table, reposition=None):
     """Propose positions for subsystem anchors: each near the anchors it serves,
     reserving room for its satellites, non-overlapping, snapped to grid.
