@@ -20,7 +20,8 @@ _NM = 1e6
 _ANCHOR_PREFIX = {"J", "P", "CN", "X", "SW", "TP", "H", "MH", "BT", "K", "M"}
 _IC_PREFIX = {"U", "IC", "A"}
 _ACTIVE_PREFIX = {"Q", "D"}          # transistors / diodes
-_ANCHOR_MIN_IC_PADS = 20             # an IC this big is a board anchor (MCU etc.)
+_ANCHOR_MIN_IC_PADS = 40             # only MCU-scale ICs anchor; regulators/
+                                     # drivers/expanders are subsystem anchors
 
 
 def _prefix(ref):
