@@ -735,10 +735,12 @@ class RouterDialog(wx.Dialog):
         prow = wx.BoxSizer(wx.HORIZONTAL)
         self.btn_edit_table = wx.Button(place_pg, label="Component table…",
                                         size=(140, -1))
+        self.btn_refresh = wx.Button(place_pg, label="Refresh", size=(74, -1))
         self.btn_undo_place = wx.Button(place_pg, label="Undo", size=(60, -1))
-        self.btn_reclassify = wx.Button(place_pg, label="Re-infer", size=(80, -1))
+        self.btn_reclassify = wx.Button(place_pg, label="Re-infer", size=(78, -1))
         prow.Add(self.btn_edit_table, 0, wx.RIGHT, 6)
         prow.AddStretchSpacer(1)
+        prow.Add(self.btn_refresh, 0, wx.RIGHT, 4)
         prow.Add(self.btn_undo_place, 0, wx.RIGHT, 4)
         prow.Add(self.btn_reclassify, 0)
         plp.Add(prow, 0, wx.EXPAND | wx.ALL, 8)
@@ -864,6 +866,7 @@ class RouterDialog(wx.Dialog):
         self.btn_sat_sel.Bind(wx.EVT_BUTTON, self.on_place_sat_sel)
         self.btn_sat_all.Bind(wx.EVT_BUTTON, self.on_place_sat_all)
         self.btn_reclassify.Bind(wx.EVT_BUTTON, self.on_reclassify)
+        self.btn_refresh.Bind(wx.EVT_BUTTON, self.on_refresh_table)
         self.btn_edit_table.Bind(wx.EVT_BUTTON, self.on_edit_table)
         self.btn_undo_place.Bind(wx.EVT_BUTTON, self.on_undo_place)
         self.subsys_list.Bind(wx.EVT_LIST_ITEM_SELECTED, self._on_subsys_select)
@@ -1255,8 +1258,9 @@ class RouterDialog(wx.Dialog):
             return
         t = self._place_table()
         self._propose_placements(
-            {r: xy for r, xy in placement.place_anchors(self.board, t).items()
-             if r in refs}, "anchor(s)")
+            {r: xy for r, xy in placement.place_anchors(
+                self.board, t, reposition=refs).items() if r in refs},
+            "anchor(s)")
 
     def on_place_anchors_all(self, _evt):
         t = self._place_table()
@@ -1270,8 +1274,9 @@ class RouterDialog(wx.Dialog):
             return
         t = self._place_table()
         self._propose_placements(
-            {r: xy for r, xy in placement.place_satellites(self.board, t).items()
-             if r in refs}, "satellite(s)")
+            {r: xy for r, xy in placement.place_satellites(
+                self.board, t, reposition=refs).items() if r in refs},
+            "satellite(s)")
 
     def on_place_sat_all(self, _evt):
         t = self._place_table()
@@ -1340,10 +1345,16 @@ class RouterDialog(wx.Dialog):
                                    on_changed=self._refresh_subsystems)
         dlg.Show()
 
+    def on_refresh_table(self, _evt):
+        # re-read the sidecar JSON (e.g. after an external agent edited it) and
+        # repopulate — keeps all edits, unlike Re-infer
+        self._refresh_place_all()
+        self.status.SetLabel("Reloaded classification from sidecar.")
+
     def on_reclassify(self, _evt):
         placement.save_table(self.board.GetFileName(), {"components": {}})
         self._refresh_place_all()
-        self.status.SetLabel("Re-inferred subsystems.")
+        self.status.SetLabel("Re-inferred subsystems (overrides cleared).")
 
     def _propose_placements(self, proposed, what):
         """Place directly into KiCad (no ghost/accept) — you tweak in the canvas,
@@ -1388,14 +1399,14 @@ class RouterDialog(wx.Dialog):
         self.status.SetLabel("Undid last placement.")
 
     def on_place_anchor(self, _evt):
+        # explicit selection = opt-in to (re)place, even if already placed
         refs = set(self._selected_subsys_refs())
         if not refs:
             wx.MessageBox("Select one or more subsystems first.", "dg-router")
             return
         table = self._place_table()
-        proposed = {r: xy for r, xy in
-                    placement.place_subsystems(self.board, table).items()
-                    if r in refs}
+        proposed = {r: xy for r, xy in placement.place_subsystems(
+            self.board, table, reposition=refs).items() if r in refs}
         self._propose_placements(proposed, "anchor(s)")
 
     def on_place_satellites(self, _evt):
@@ -1407,9 +1418,8 @@ class RouterDialog(wx.Dialog):
         want = set()
         for r in refs:
             want.update(placement.satellites_of(table, r))
-        proposed = {r: xy for r, xy in
-                    placement.place_satellites(self.board, table).items()
-                    if r in want}
+        proposed = {r: xy for r, xy in placement.place_satellites(
+            self.board, table, reposition=want).items() if r in want}
         self._propose_placements(proposed, "satellite(s)")
 
     def on_place_all_anchors(self, _evt):
