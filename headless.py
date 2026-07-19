@@ -25,6 +25,7 @@ import pcbnew  # noqa: E402  (embedded interpreter provides this)
 
 import shim  # noqa: E402
 import router  # noqa: E402
+import placement  # noqa: E402
 
 
 def main(argv=None):
@@ -46,6 +47,10 @@ def main(argv=None):
                          "(a 'job' of specific pad-pairs); implies --solve")
     ap.add_argument("--auto-trunk", dest="auto_trunk", default=None,
                     help="route a power net as trunk (MST spine) + branches")
+    ap.add_argument("--classify", action="store_true",
+                    help="infer component tiers (anchor/subsystem/satellite) + parents")
+    ap.add_argument("--classify-write", dest="classify_write", action="store_true",
+                    help="write the inferred classification to the sidecar JSON")
     ap.add_argument("--layer", default="B.Cu", help="prefer layer")
     ap.add_argument("--via-cost", type=int, default=80)
     ap.add_argument("--edge-hug", type=float, default=0.0)
@@ -69,6 +74,7 @@ def main(argv=None):
 
     if args.list or not (args.status or args.render or args.render_png
                          or args.emit or args.solve or args.auto_trunk
+                         or args.classify or args.classify_write
                          or args.list_connections is not None or args.connect):
         nets = shim.list_nets(board)
         print("copper layers:", ", ".join(shim.copper_layer_names(board)))
@@ -115,6 +121,22 @@ def main(argv=None):
         after = sum(len(v) for v in shim.drc_unconnected(out).values())
         print("tracks added: %d" % summary["tracks_added"])
         print("unconnected: %d -> %d  (wrote %s)" % (before, after, out))
+
+    if args.classify or args.classify_write:
+        table = placement.effective_table(board, args.board)
+        by_type = {"anchor": [], "subsystem_anchor": [], "satellite": []}
+        for ref, info in table.items():
+            by_type.setdefault(info["type"], []).append((ref, info))
+        for t in ("anchor", "subsystem_anchor", "satellite"):
+            rows = sorted(by_type.get(t, []))
+            print("== %s (%d) ==" % (t, len(rows)))
+            for ref, info in rows:
+                par = ", ".join(info["parents"]) if info["parents"] else "-"
+                print("  %-8s %-14s parents: %s" % (ref, info["value"], par))
+        if args.classify_write:
+            out = {"components": {r: {"type": i["type"], "parents": i["parents"]}
+                                  for r, i in table.items()}}
+            print("wrote:", placement.save_table(args.board, out))
 
     if args.auto_trunk:
         before = sum(len(v) for v in shim.drc_unconnected(args.board).values())
