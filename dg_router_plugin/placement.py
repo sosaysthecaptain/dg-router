@@ -93,8 +93,16 @@ def classify(board):
             parents = [c for c, s in sorted(scores.items(), key=lambda x: -x[1])
                        if s >= best * 0.5][:2]
         out[ref] = {"type": t, "parents": parents,
-                    "value": fp.GetValue(), "pads": fp.GetPadCount()}
+                    "value": fp.GetValue(), "name": fp.GetValue(),
+                    "pads": fp.GetPadCount()}
     return out
+
+
+def satellites_of(table, subsystem_ref):
+    """Refs of the satellites parented onto a subsystem anchor."""
+    return sorted(r for r, i in table.items()
+                  if i["type"] == "satellite"
+                  and subsystem_ref in i.get("parents", []))
 
 
 def _fp_size(fp):
@@ -322,5 +330,5 @@ def effective_table(board, board_path):
     for ref, ov in saved.items():
         if ref in table:
             table[ref].update({k: v for k, v in ov.items()
-                               if k in ("type", "parents")})
+                               if k in ("type", "parents", "name")})
     return table
