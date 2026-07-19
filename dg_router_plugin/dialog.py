@@ -642,9 +642,11 @@ class RouterDialog(wx.Dialog):
         route_pg = wx.Panel(self.tabs)
         power_pg = wx.Panel(self.tabs)
         place_pg = wx.Panel(self.tabs)
+        nets_pg = wx.Panel(self.tabs)
         self.tabs.AddPage(route_pg, "Route")
         self.tabs.AddPage(power_pg, "Power net")
         self.tabs.AddPage(place_pg, "Place")
+        self.tabs.AddPage(nets_pg, "Nets")
         left.Add(self.tabs, 1, wx.EXPAND | wx.ALL, 8)
 
         self._obj_keys = ["least_obtrusive", "direct", "follow", "hug"]
@@ -825,6 +827,38 @@ class RouterDialog(wx.Dialog):
         stp.Add(strow, 0, wx.EXPAND | wx.ALL, 6)
         sats_pg.SetSizer(stp)
 
+        # --- Nets tab: view/hide ratsnest by subsystem or component ---
+        np = wx.BoxSizer(wx.VERTICAL)
+        np.Add(wx.StaticText(nets_pg, label=(
+            "Show/hide the ratsnest (airwires). Check a row to show its "
+            "connections; uncheck to hide.")), 0, wx.ALL, 6)
+        nrow = wx.BoxSizer(wx.HORIZONTAL)
+        self.btn_nets_all = wx.Button(nets_pg, label="Show all")
+        self.btn_nets_none = wx.Button(nets_pg, label="Hide all")
+        nrow.Add(wx.StaticText(nets_pg, label="Group by:"),
+                 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 6)
+        self.net_mode = wx.Choice(nets_pg, choices=["Subsystem", "Component"])
+        self.net_mode.SetSelection(0)
+        nrow.Add(self.net_mode, 0, wx.RIGHT, 12)
+        nrow.AddStretchSpacer(1)
+        nrow.Add(self.btn_nets_all, 0, wx.RIGHT, 6)
+        nrow.Add(self.btn_nets_none, 0)
+        np.Add(nrow, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 6)
+
+        self.net_group_list = wx.ListCtrl(nets_pg, style=wx.LC_REPORT)
+        self.net_group_list.EnableCheckBoxes(True)
+        self.net_group_list.InsertColumn(0, "Group", width=300)
+        self.net_group_list.InsertColumn(1, "Nets", width=54)
+        np.Add(self.net_group_list, 1, wx.EXPAND | wx.ALL, 6)
+
+        hlrow = wx.BoxSizer(wx.HORIZONTAL)
+        self.btn_net_hl = wx.Button(nets_pg, label="Highlight selected")
+        self.btn_net_clearhl = wx.Button(nets_pg, label="Clear highlight")
+        hlrow.Add(self.btn_net_hl, 1, wx.RIGHT, 6)
+        hlrow.Add(self.btn_net_clearhl, 1)
+        np.Add(hlrow, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 6)
+        nets_pg.SetSizer(np)
+
         # === shared action area (applies to whatever the active tab proposed) ===
         self.btn_cancel = wx.Button(leftp, label="Cancel")
         left.Add(self.btn_cancel, 0, wx.EXPAND | wx.LEFT | wx.RIGHT, 8)
@@ -883,6 +917,13 @@ class RouterDialog(wx.Dialog):
         self.btn_revert.Bind(wx.EVT_BUTTON, self.on_revert)
         self.btn_all.Bind(wx.EVT_BUTTON, lambda e: self._check_all(True))
         self.btn_none.Bind(wx.EVT_BUTTON, lambda e: self._check_all(False))
+        self.btn_nets_all.Bind(wx.EVT_BUTTON, lambda e: self.on_nets_show_all(True))
+        self.btn_nets_none.Bind(wx.EVT_BUTTON, lambda e: self.on_nets_show_all(False))
+        self.net_mode.Bind(wx.EVT_CHOICE, lambda e: self._refresh_nets())
+        self.net_group_list.Bind(wx.EVT_LIST_ITEM_CHECKED, self._on_net_check)
+        self.net_group_list.Bind(wx.EVT_LIST_ITEM_UNCHECKED, self._on_net_check)
+        self.btn_net_hl.Bind(wx.EVT_BUTTON, self.on_net_highlight)
+        self.btn_net_clearhl.Bind(wx.EVT_BUTTON, self.on_net_clear_highlight)
         self.btn_claude.Bind(wx.EVT_BUTTON, self.on_driving)
         self.net_list.Bind(wx.EVT_LIST_ITEM_SELECTED, self.on_select)
         self.net_list.Bind(wx.EVT_LIST_ITEM_CHECKED, self.on_net_checked)
@@ -1198,22 +1239,149 @@ class RouterDialog(wx.Dialog):
         # On Place, hide our preview and slim to a control strip — placement
         # happens in KiCad's own canvas (where you also nudge the parts). Routing
         # keeps the preview.
-        place = self.tabs.GetSelection() == 2
+        sel = self.tabs.GetSelection()
+        place = sel == 2
+        slim = sel in (2, 3)                               # Place + Nets: no preview
         szr = self.panel.GetSizer()
-        szr.Show(self.preview, not place)                 # frees its space
-        # on Place: no preview, so the controls fill the width and the window
-        # shrinks to just that; on Route: cap the left column, restore full width
-        szr.GetItem(self.leftp).SetProportion(1 if place else 0)
-        self.leftp.SetMaxSize((-1, -1) if place else (400, -1))
+        szr.Show(self.preview, not slim)                  # frees its space
+        # slim tabs: no preview, controls fill the width, window shrinks to it;
+        # Route/Power: cap the left column, restore full width for the preview
+        szr.GetItem(self.leftp).SetProportion(1 if slim else 0)
+        self.leftp.SetMaxSize((-1, -1) if slim else (400, -1))
         self.panel.Layout()
-        self.SetSize((520 if place else 1040, self.GetSize().height))
+        self.SetSize((520 if slim else 1040, self.GetSize().height))
         self.panel.Layout()
         if place and self._loaded:
             self._refresh_place_all()
+        if sel == 3 and self._loaded:
+            self._refresh_nets()
 
     def _on_ptab(self, _evt):
         if self._loaded:
             self._refresh_place_all()
+
+    # ---- Nets tab: view/hide ratsnest by subsystem or component ----
+    def _net_groups(self):
+        """[(label, [refs], netcount)] for the current Group-by mode."""
+        table = self._place_table()
+        fps = {fp.GetReference(): fp for fp in self.board.GetFootprints()
+               if fp.GetReference()}
+
+        def netcount(refs):
+            nets = set()
+            for r in refs:
+                fp = fps.get(r)
+                if not fp:
+                    continue
+                for pad in fp.Pads():
+                    if pad.GetNetCode() > 0:
+                        nets.add(pad.GetNetCode())
+            return len(nets)
+
+        groups = []
+        if self.net_mode.GetSelection() == 0:               # by subsystem
+            subs = sorted((r for r, i in table.items()
+                           if i["type"] == "subsystem_anchor"),
+                          key=lambda r: (table[r].get("name") or r).lower())
+            for r in subs:
+                refs = [r] + placement.satellites_of(table, r)
+                refs = [x for x in refs if x in fps]
+                nm = table[r].get("name") or table[r].get("value") or r
+                groups.append(("%s (%s)" % (r, nm), refs, netcount(refs)))
+        else:                                               # by component
+            for r in sorted(fps):
+                nm = table.get(r, {}).get("name") or table.get(r, {}).get("value") or ""
+                label = "%s (%s)" % (r, nm) if nm else r
+                groups.append((label, [r], netcount([r])))
+        return groups
+
+    def _refresh_nets(self):
+        # ensure the global ratsnest layer is on, else nothing shows regardless
+        try:
+            self.board.SetElementVisibility(pcbnew.LAYER_RATSNEST, True)
+        except Exception:
+            pass
+        self._net_group_refs = self._net_groups()
+        L = self.net_group_list
+        L.DeleteAllItems()
+        fps = {fp.GetReference(): fp for fp in self.board.GetFootprints()
+               if fp.GetReference()}
+        for label, refs, ncount in self._net_group_refs:
+            row = L.InsertItem(L.GetItemCount(), label)
+            L.SetItem(row, 1, str(ncount))
+            # reflect current visibility: checked if any pad in the group is shown
+            shown = False
+            for r in refs:
+                fp = fps.get(r)
+                if fp and any(p.GetLocalRatsnestVisible() for p in fp.Pads()):
+                    shown = True
+                    break
+            L.CheckItem(row, shown)
+
+    def _set_group_ratsnest(self, refs, visible):
+        fps = {fp.GetReference(): fp for fp in self.board.GetFootprints()
+               if fp.GetReference()}
+        for r in refs:
+            fp = fps.get(r)
+            if not fp:
+                continue
+            for pad in fp.Pads():
+                pad.SetLocalRatsnestVisible(visible)
+
+    def _on_net_check(self, evt):
+        idx = evt.GetIndex()
+        if idx < 0 or idx >= len(getattr(self, "_net_group_refs", [])):
+            return
+        _, refs, _ = self._net_group_refs[idx]
+        self._set_group_ratsnest(refs, self.net_group_list.IsItemChecked(idx))
+        self._refresh_canvas()
+
+    def on_nets_show_all(self, visible):
+        try:
+            self.board.SetElementVisibility(pcbnew.LAYER_RATSNEST, True)
+        except Exception:
+            pass
+        for fp in self.board.GetFootprints():
+            for pad in fp.Pads():
+                pad.SetLocalRatsnestVisible(visible)
+        for i in range(self.net_group_list.GetItemCount()):
+            self.net_group_list.CheckItem(i, visible)
+        self._refresh_canvas()
+        self.status.SetLabel("Ratsnest: %s all." % ("showing" if visible else "hidden"))
+
+    def on_net_highlight(self, _evt):
+        sel = self.net_group_list.GetFirstSelected()
+        if sel < 0 or sel >= len(getattr(self, "_net_group_refs", [])):
+            wx.MessageBox("Select a group row to highlight.", "dg-router")
+            return
+        _, refs, _ = self._net_group_refs[sel]
+        fps = {fp.GetReference(): fp for fp in self.board.GetFootprints()
+               if fp.GetReference()}
+        codes = []
+        for r in refs:
+            fp = fps.get(r)
+            if not fp:
+                continue
+            for pad in fp.Pads():
+                nc = pad.GetNetCode()
+                if nc > 0 and nc not in codes:
+                    codes.append(nc)
+        try:
+            self.board.ResetNetHighLight()
+            for i, nc in enumerate(codes):
+                self.board.SetHighLightNet(nc, i > 0)
+        except Exception:
+            pass
+        self._refresh_canvas()
+        self.status.SetLabel("Highlighted %d net(s)." % len(codes))
+
+    def on_net_clear_highlight(self, _evt):
+        try:
+            self.board.ResetNetHighLight()
+        except Exception:
+            pass
+        self._refresh_canvas()
+        self.status.SetLabel("Cleared net highlight.")
 
     def _refresh_place_all(self):
         self._refresh_anchors()
