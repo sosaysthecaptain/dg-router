@@ -885,6 +885,7 @@ class RouterDialog(wx.Dialog):
         self._apply_status()
         self._loaded = True
         self._update_route_enabled()
+        self._refresh_subsystems()   # populate Place once data is ready
         c = {"routed": 0, "partial": 0, "unrouted": 0}
         for x in self.status_map.values():
             c[x] += 1
