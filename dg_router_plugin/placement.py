@@ -461,7 +461,24 @@ def _sat_orientation(fp, netcode, side):
     return base % 360.0
 
 
-def place_satellites(board, table, reposition=None):
+KNOB_DEFAULTS = {"compactness": 0.5, "orderliness": 1.0, "min_distance": 0.7}
+
+
+def _knobs(k):
+    d = dict(KNOB_DEFAULTS)
+    if k:
+        d.update({kk: max(0.0, min(1.0, vv)) for kk, vv in k.items() if kk in d})
+    return d
+
+
+def _make_item(ref, fps, deg, want):
+    w0, h0 = _canonical_wh(fps[ref])
+    w, h = (w0, h0) if int(round(deg)) % 180 == 0 else (h0, w0)
+    return {"ref": ref, "deg": deg, "w": w, "h": h, "want": want,
+            "halo": _fanout_halo(fps[ref])}
+
+
+def place_satellites(board, table, reposition=None, knobs=None):
     """Tidy per-side placement. Each subsystem's passives are grouped by the chip
     EDGE nearest the pin they serve, then laid in a straight, evenly-spaced,
     aligned RANK just off that edge — oriented (in 90deg steps) so the connecting
@@ -507,40 +524,120 @@ def place_satellites(board, table, reposition=None):
         meta[ref] = (par, px, py, nc, side)
         by_parent.setdefault(par, []).append(ref)
 
+    knobs = _knobs(knobs)
     proposed = {}
     for par, refs in by_parent.items():
+        pcx, pcy, pw, ph = _fp_box(fps[par])
+        H = _fanout_halo(fps[par])
         sides = {}
         for ref in refs:
             sides.setdefault(meta[ref][4], []).append(ref)
         for side, members in sides.items():
-            _place_rank(side, members, meta, fps, region, obstacles, proposed)
+            vert = side in ("L", "R")
+            items = []
+            for ref in members:
+                nc = meta[ref][3]
+                deg = _sat_orientation(fps[ref], nc, side)
+                want = meta[ref][2] if vert else meta[ref][1]
+                items.append(_make_item(ref, fps, deg, want))
+            _place_rank(side, items, pcx, pcy, pw, ph, H,
+                        region, obstacles, proposed, knobs)
     return proposed
 
 
-def _place_rank(side, members, meta, fps, region, obstacles, proposed):
-    """Lay one chip edge's satellites in a straight aligned rank near their pins.
-    Mutates `proposed` (ref -> (x,y,deg)) and `obstacles`."""
+def place_subsystem_cluster(board, table, ref, origin=None, knobs=None,
+                            anchor_deg=None):
+    """Arrange a whole subsystem (anchor `ref` + its satellites) as ONE compact
+    cluster centered at `origin`=(x,y) mm — independent of where the anchor
+    currently sits. For the 'park it in empty space, then drag the mass to its
+    final spot' workflow. Returns {ref: (x, y, orient_deg)} for the anchor and
+    every placeable satellite. `knobs` = {compactness, orderliness, min_distance}
+    each 0..1."""
+    knobs = _knobs(knobs)
+    region = _board_region(board)
     rx0, ry0, rx1, ry1 = region
-    vert = side in ("L", "R")            # rank runs along Y?
-    sign = 1.0 if side in ("R", "B") else -1.0
-    gap = 0.45
+    if origin is None:                       # default: park just off the right edge
+        origin = (rx1 + 12.0, ry0 + 12.0)
+    ox, oy = origin
+    # allow the cluster to live off-board (parking); don't clip to the outline
+    big = (min(rx0, ox) - 300, min(ry0, oy) - 300,
+           max(rx1, ox) + 300, max(ry1, oy) + 300)
+    fps = {fp.GetReference(): fp for fp in board.GetFootprints()
+           if fp.GetReference()}
+    if ref not in fps:
+        return {}
+    cn, net_size, _ = _component_nets(board)
+    anchor = fps[ref]
+    if anchor_deg is None:
+        anchor_deg = anchor.GetOrientationDegrees()
+    aw, ah = _canonical_wh(anchor)
+    pw, ph = (aw, ah) if int(round(anchor_deg)) % 180 == 0 else (ah, aw)
+    H = _fanout_halo(anchor)
+    proposed = {ref: (ox, oy, anchor_deg)}
 
-    par = meta[members[0]][0]
-    pcx, pcy, pw, ph = _fp_box(fps[par])
-    H = _fanout_halo(fps[par])
+    members = set([ref]) | set(satellites_of(table, ref))
+    obstacles = []
+    for r, fp in fps.items():
+        if r in members or is_unplaced(fp, region):
+            continue
+        cx, cy, w, h = _fp_box(fp)
+        obstacles.append([cx, cy, w, h, _fanout_halo(fp)])
+    obstacles.append([ox, oy, pw, ph, H])    # the parked anchor itself
 
-    items = []
-    for ref in members:
-        nc = meta[ref][3]
-        deg = _sat_orientation(fps[ref], nc, side)
-        w0, h0 = _canonical_wh(fps[ref])
-        w, h = (w0, h0) if int(round(deg)) % 180 == 0 else (h0, w0)
-        want = meta[ref][2] if vert else meta[ref][1]   # pin coord along the edge
-        items.append({"ref": ref, "deg": deg, "w": w, "h": h, "want": want,
-                      "halo": _fanout_halo(fps[ref])})
+    # assign satellites to sides from the anchor's LOCAL pin geometry, so it
+    # works no matter where the anchor currently is on (or off) the board
+    byside, lm = {}, {}
+    for s in (x for x in satellites_of(table, ref) if x in fps):
+        shared = cn.get(s, set()) & cn.get(ref, set())
+        best_net, best_sz = None, 1e9
+        for nc in shared:
+            if net_size.get(nc, 1e9) < best_sz:
+                best_sz, best_net = net_size[nc], nc
+        pad = _pad_on_net(anchor, best_net) if best_net is not None else None
+        if pad is not None:
+            p0 = pad.GetFPRelativePosition()
+            lx, ly = _rot(p0.x, p0.y, anchor_deg)
+            lx, ly = lx / _NM, ly / _NM
+        else:
+            lx, ly = 0.0, 0.0
+        phw, phh = max(pw / 2.0, 0.1), max(ph / 2.0, 0.1)
+        if abs(lx) / phw >= abs(ly) / phh:
+            side = "R" if lx >= 0 else "L"
+        else:
+            side = "B" if ly >= 0 else "T"
+        lm[s] = (best_net, side, ox + lx, oy + ly)
+        byside.setdefault(side, []).append(s)
+
+    for side, group in byside.items():
+        vert = side in ("L", "R")
+        items = []
+        for s in group:
+            nc, _, wx_, wy_ = lm[s]
+            deg = _sat_orientation(fps[s], nc, side)
+            items.append(_make_item(s, fps, deg, wy_ if vert else wx_))
+        _place_rank(side, items, ox, oy, pw, ph, H, big, obstacles, proposed, knobs)
+    return proposed
+
+
+def _place_rank(side, items, pcx, pcy, pw, ph, H, region, obstacles, proposed,
+                knobs):
+    """Lay one chip edge's satellites in a rank. `items` are pre-built dicts
+    {ref,deg,w,h,want,halo}. Knobs shape it:
+      compactness  -> spacing tightness (gap + halo scale)
+      orderliness  -> along-edge uniformity (0 = hug each pin/ragged, 1 = even)
+      min_distance -> perp closeness to the chip (1 = hug, 0 = pushed out)
+    Mutates `proposed` (ref -> (x,y,deg)) and `obstacles`."""
     if not items:
         return
+    rx0, ry0, rx1, ry1 = region
+    vert = side in ("L", "R")
+    sign = 1.0 if side in ("R", "B") else -1.0
+    c, o, m = knobs["compactness"], knobs["orderliness"], knobs["min_distance"]
+    gap = 0.45 * (2.0 - 1.6 * c)             # airy .. tight
+    hscale = 1.6 - 0.9 * c
+    Hs = H * hscale
     items.sort(key=lambda it: it["want"])
+    n = len(items)
 
     def along(it):
         return it["h"] if vert else it["w"]
@@ -548,18 +645,29 @@ def _place_rank(side, members, meta, fps, region, obstacles, proposed):
     def perp(it):
         return it["w"] if vert else it["h"]
 
-    # spread along the edge: keep near the pin, enforce min pitch (both directions)
-    pos = [it["want"] for it in items]
-    for i in range(1, len(items)):
+    # pin-aligned positions (min pitch enforced both directions)
+    pin = [it["want"] for it in items]
+    for i in range(1, n):
         need = (along(items[i - 1]) + along(items[i])) / 2.0 + gap
-        pos[i] = max(pos[i], pos[i - 1] + need)
-    for i in range(len(items) - 2, -1, -1):
+        pin[i] = max(pin[i], pin[i - 1] + need)
+    for i in range(n - 2, -1, -1):
         need = (along(items[i]) + along(items[i + 1])) / 2.0 + gap
-        pos[i] = min(pos[i], pos[i + 1] - need)
+        pin[i] = min(pin[i], pin[i + 1] - need)
+    # evenly distributed, centered on the mean pin coordinate
+    total = sum(along(it) for it in items) + gap * (n - 1)
+    mean = sum(it["want"] for it in items) / n
+    even, cur = [], mean - total / 2.0
+    for it in items:
+        cur += along(it) / 2.0
+        even.append(cur)
+        cur += along(it) / 2.0 + gap
+    # orderliness: 0 -> pin-aligned (ragged), 1 -> evenly spaced (neat)
+    pos = [pin[i] * (1.0 - o) + even[i] * o for i in range(n)]
 
     maxperp = max(perp(it) for it in items)
     phalf = (pw if vert else ph) / 2.0
     base_center = pcx if vert else pcy
+    extra = (1.0 - m) * 3.0                   # min_distance: push out when low
 
     def clears(x, y, it):
         w, h = it["w"], it["h"]
@@ -568,33 +676,29 @@ def _place_rank(side, members, meta, fps, region, obstacles, proposed):
             return False
         for ob in obstacles:
             if _overlap(x, y, w, h, ob[0], ob[1], ob[2], ob[3],
-                        max(it["halo"], ob[4])):
+                        max(it["halo"] * hscale, ob[4])):
                 return False
         return True
 
-    # try successive ranks (pushed outward from the chip). Prefer the CLOSEST
-    # rank whose whole row is clear (tidy + short). If none is fully clear,
-    # fall back to the closest rank that places the MOST parts (survivors stay
-    # near the chip and aligned on one line; the rest are dropped, not stacked).
     RANKS = 10
-    best = None                              # (count, rank_i, [(x,y,it)...])
+    best = None
     for rank_i in range(RANKS):
-        rc = base_center + sign * (phalf + H + maxperp / 2.0 + 0.15 +
+        rc = base_center + sign * (phalf + Hs + maxperp / 2.0 + 0.15 + extra +
                                    rank_i * (maxperp + gap))
         row = []
         for it, a in zip(items, pos):
             x, y = (rc, a) if vert else (a, rc)
             if clears(x, y, it):
                 row.append((x, y, it))
-        if len(row) == len(items):           # whole rank fits -> take it now
-            best = (len(row), rank_i, row)
+        if len(row) == n:
+            best = (n, rank_i, row)
             break
         if best is None or len(row) > best[0]:
             best = (len(row), rank_i, row)
     if best:
         for x, y, it in best[2]:
             proposed[it["ref"]] = (x, y, it["deg"])
-            obstacles.append([x, y, it["w"], it["h"], it["halo"]])
+            obstacles.append([x, y, it["w"], it["h"], it["halo"] * hscale])
 
 
 def _spiral_free(tx, ty, w, h, placed, region, m, halo=0.6):
