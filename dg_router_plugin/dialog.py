@@ -796,9 +796,10 @@ class RouterDialog(wx.Dialog):
         sp.Add(self.sat_label, 0, wx.LEFT | wx.RIGHT, 6)
         self.sat_list = wx.ListCtrl(subs_pg, style=wx.LC_REPORT)
         self.sat_list.InsertColumn(0, "Ref", width=46)
-        self.sat_list.InsertColumn(1, "Name", width=210)
+        self.sat_list.InsertColumn(1, "Name", width=190)
         self.sat_list.InsertColumn(2, "Size(mm)", width=62)
-        self.sat_list.InsertColumn(3, "Placed", width=46)
+        self.sat_list.InsertColumn(3, "Pins", width=42)
+        self.sat_list.InsertColumn(4, "Placed", width=46)
         sp.Add(self.sat_list, 1, wx.EXPAND | wx.ALL, 6)
         self.btn_place_one = wx.Button(
             subs_pg, label="Place selected satellite(s)")
@@ -810,10 +811,11 @@ class RouterDialog(wx.Dialog):
         self.allsat_list = wx.ListCtrl(sats_pg,
                                        style=wx.LC_REPORT)
         self.allsat_list.InsertColumn(0, "Ref", width=44)
-        self.allsat_list.InsertColumn(1, "Name", width=210)
+        self.allsat_list.InsertColumn(1, "Name", width=190)
         self.allsat_list.InsertColumn(2, "Subsystem", width=90)
         self.allsat_list.InsertColumn(3, "Size(mm)", width=58)
-        self.allsat_list.InsertColumn(4, "Placed", width=44)
+        self.allsat_list.InsertColumn(4, "Pins", width=40)
+        self.allsat_list.InsertColumn(5, "Placed", width=44)
         stp.Add(self.allsat_list, 1, wx.EXPAND | wx.ALL, 6)
         strow = wx.BoxSizer(wx.HORIZONTAL)
         self.btn_sat_sel = wx.Button(sats_pg, label="Place selected")
@@ -1263,7 +1265,8 @@ class RouterDialog(wx.Dialog):
             L.SetItem(row, 1, info.get("name") or info.get("value") or "")
             L.SetItem(row, 2, pname)
             L.SetItem(row, 3, "%.1f×%.1f" % (w, h))
-            L.SetItem(row, 4, "yes" if placed else "no")
+            L.SetItem(row, 4, str(placement._connected_pins(fp)) if fp else "0")
+            L.SetItem(row, 5, "yes" if placed else "no")
 
     def _selected_rows(self, listctrl, refs):
         out, i = [], listctrl.GetFirstSelected()
@@ -1360,7 +1363,9 @@ class RouterDialog(wx.Dialog):
             self.sat_list.SetItem(row, 1, table[s].get("name")
                                   or table[s].get("value", ""))
             self.sat_list.SetItem(row, 2, "%.1f×%.1f" % (w, h))
-            self.sat_list.SetItem(row, 3, "yes" if placed else "no")
+            self.sat_list.SetItem(row, 3,
+                                  str(placement._connected_pins(fp)) if fp else "0")
+            self.sat_list.SetItem(row, 4, "yes" if placed else "no")
 
     def _on_subsys_select(self, _evt):
         self._refresh_sat_detail()
