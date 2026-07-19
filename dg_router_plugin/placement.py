@@ -203,6 +203,63 @@ def place_subsystems(board, table, reposition=None):
     return proposed
 
 
+def _satellite_target(board, ref, info, fps, cn, net_size, region):
+    """Where a satellite wants to sit: on top of the parent PAD it serves (the
+    lowest-fanout shared net = the specific signal pin), so the trace is tiny."""
+    par = None
+    for p in info["parents"]:
+        if p in fps and not is_unplaced(fps[p], region):
+            par = p
+            break
+    if par is None:
+        return (None, None)
+    shared = cn.get(ref, set()) & cn.get(par, set())
+    best_net, best_sz = None, 1e9
+    for nc in shared:
+        if net_size.get(nc, 1e9) < best_sz:
+            best_sz, best_net = net_size[nc], nc
+    parfp = fps[par]
+    if best_net is not None:
+        for pad in parfp.Pads():
+            if pad.GetNetCode() == best_net:
+                pp = pad.GetPosition()
+                return (pp.x / _NM, pp.y / _NM)
+    p = parfp.GetPosition()
+    return (p.x / _NM, p.y / _NM)
+
+
+def place_satellites(board, table, reposition=None):
+    """Propose positions for unplaced satellites: each nestled against the parent
+    pin it serves, non-overlapping, snapped. Parent must already be placed."""
+    reposition = set(reposition or [])
+    region = _board_region(board)
+    fps = {fp.GetReference(): fp for fp in board.GetFootprints()
+           if fp.GetReference()}
+    cn, net_size, _ = _component_nets(board)
+
+    placed = []
+    for ref, info in table.items():
+        fp = fps.get(ref)
+        if fp is None or is_unplaced(fp, region):
+            continue
+        w, h = _fp_size(fp)
+        p = fp.GetPosition()
+        placed.append([p.x / _NM, p.y / _NM, w, h])
+
+    proposed = {}
+    sats = [(r, i) for r, i in table.items() if i["type"] == "satellite"
+            and r in fps and (is_unplaced(fps[r], region) or r in reposition)]
+    for ref, info in sats:
+        w, h = _fp_size(fps[ref])
+        tx, ty = _satellite_target(board, ref, info, fps, cn, net_size, region)
+        if tx is None:
+            continue
+        pos = _spiral_free(tx, ty, w, h, placed, region, 0.3)
+        proposed[ref] = pos
+        placed.append([pos[0], pos[1], w, h])
+    return proposed
+
+
 def _spiral_free(tx, ty, w, h, placed, region, m):
     """Nearest grid position to (tx,ty) whose reserved box clears all placed
     boxes and stays in the board. Expanding-ring search."""

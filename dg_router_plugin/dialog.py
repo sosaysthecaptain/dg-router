@@ -24,6 +24,7 @@ import wx.svg
 
 from . import shim
 from . import router
+from . import placement
 
 # overlay colors
 _C_PAD = wx.Colour(255, 235, 59)
@@ -53,6 +54,7 @@ _STATUS_WORD = {"routed": "routed", "partial": "partial", "unrouted": "unrouted"
 
 _C_CONN = wx.Colour(120, 245, 255)        # a connection IN the job (bright)
 _C_CONN_OFF = wx.Colour(150, 120, 170)    # shown but not in the job (dim)
+_C_PLACE = wx.Colour(120, 245, 160)       # proposed component placement (ghost)
 
 _OPEN = []   # keep non-modal dialogs alive
 
@@ -82,6 +84,7 @@ class PreviewPanel(wx.Panel):
         self.accepted = []               # committed this session (persist in view)
         self.conns = []                  # [{id,net,gap}] connections to show
         self.job_ids = set()             # which connection ids are in the job
+        self.placements = []             # [{ref,x,y,w,h}] proposed part positions
         self.on_pad_pick = None          # callback(net_name) on a pad click
         self.on_conn_toggle = None       # callback(conn) on a ratline click
         self._down = None                # (x,y) at mouse-down, to tell click vs drag
@@ -135,6 +138,13 @@ class PreviewPanel(wx.Panel):
         self.Refresh()
         self.Update()   # force an immediate repaint (Refresh alone from a
                         # CallAfter after the route thread didn't always paint)
+
+    def set_placements(self, placements):
+        """placements=[{ref,x,y,w,h}] mm — proposed part positions, drawn as
+        labeled ghost boxes."""
+        self.placements = placements or []
+        self.Refresh()
+        self.Update()
 
     def set_connections(self, conns, job_ids):
         """conns=[{id,net,gap}] to draw as ratlines; job_ids=set of ids that are
@@ -257,6 +267,24 @@ class PreviewPanel(wx.Panel):
             self._reraster(min(target, _BG_PPM_MAX))
         elif target < self._bmp_ppm * 0.5 and self._bmp_ppm > _BG_PPM:
             self._reraster(_BG_PPM)
+
+    def rerender(self, path):
+        """Rebuild the board background from a given .kicad_pcb (used after parts
+        move on placement-accept, since the real file isn't saved yet)."""
+        try:
+            svg = os.path.join(tempfile.gettempdir(), "dg-router-preview.svg")
+            shim.render_board_svg(path, svg)
+            self._svg = svg
+            self.vbw, self.vbh = shim.parse_svg_viewbox(svg)
+            self.origin = shim.plot_origin(self.board, self.vbw, self.vbh)
+            self._bmp_ppm = _BG_PPM
+            img = wx.svg.SVGimage.CreateFromFile(svg)
+            self.bg_bmp = img.ConvertToScaledBitmap(
+                wx.Size(max(1, int(self.vbw * _BG_PPM)),
+                        max(1, int(self.vbh * _BG_PPM))))
+            self.Refresh()
+        except Exception:
+            pass
 
     def _reraster(self, ppm):
         try:
@@ -410,7 +438,7 @@ class PreviewPanel(wx.Panel):
 
         # dim the board when anything is highlighted so the overlays pop — but
         # subtly, so the rest of the traces stay faintly visible for context
-        if self.selected or self.proposed or self.accepted:
+        if self.selected or self.proposed or self.accepted or self.placements:
             gc.SetPen(wx.Pen(wx.Colour(0, 0, 0, 0), 0))
             gc.SetBrush(wx.Brush(wx.Colour(0, 0, 0, 60)))
             gc.DrawRectangle(bx0, by0, self.vbw * ppm, self.vbh * ppm)
@@ -472,6 +500,22 @@ class PreviewPanel(wx.Panel):
                 rr = max(dia / 2.0 * ppm, 4)
                 gc.DrawEllipse(cx - rr, cy - rr, 2 * rr, 2 * rr)
 
+        # proposed component placements: labeled ghost boxes
+        if self.placements:
+            gc.SetPen(wx.Pen(_C_PLACE, 2))
+            gc.SetBrush(wx.Brush(wx.Colour(_C_PLACE.Red(), _C_PLACE.Green(),
+                                           _C_PLACE.Blue(), 45)))
+            for p in self.placements:
+                cx, cy = S(p["x"], p["y"])
+                w, h = p["w"] * ppm, p["h"] * ppm
+                gc.DrawRectangle(cx - w / 2, cy - h / 2, w, h)
+                if ppm > 4:
+                    gc.SetFont(gc.CreateFont(
+                        wx.Font(wx.FontInfo(max(7, min(11, int(h / 3)))),),
+                        _C_PLACE))
+                    tw, th = gc.GetTextExtent(p["ref"])
+                    gc.DrawText(p["ref"], cx - tw / 2, cy - th / 2)
+
 
 class RouterDialog(wx.Dialog):
     def __init__(self, board):
@@ -487,6 +531,9 @@ class RouterDialog(wx.Dialog):
         self._loaded = False
         self._try_seed = 0
         self._cancel = threading.Event()
+        self._proposal = None  # 'route' | 'place' — what Accept will apply
+        self._place_refs = []  # refs shown in the Place checklist (row order)
+        self._place_proposed = {}   # ref -> (x,y) proposed positions
 
         panel = wx.Panel(self)
         main = wx.BoxSizer(wx.HORIZONTAL)
@@ -529,8 +576,10 @@ class RouterDialog(wx.Dialog):
         self.tabs = wx.Notebook(panel)
         route_pg = wx.Panel(self.tabs)
         power_pg = wx.Panel(self.tabs)
+        place_pg = wx.Panel(self.tabs)
         self.tabs.AddPage(route_pg, "Route")
         self.tabs.AddPage(power_pg, "Power net")
+        self.tabs.AddPage(place_pg, "Place")
         left.Add(self.tabs, 0, wx.EXPAND | wx.ALL, 8)
 
         rp = wx.BoxSizer(wx.VERTICAL)
@@ -575,6 +624,29 @@ class RouterDialog(wx.Dialog):
         pp.Add(self.btn_trunk, 0, wx.EXPAND | wx.ALL, 6)
         power_pg.SetSizer(pp)
 
+        # --- Place tab: put unplaced parts near their anchors ---
+        plp = wx.BoxSizer(wx.VERTICAL)
+        plp.Add(wx.StaticText(place_pg, label=(
+            "Place unplaced parts near their anchors.\n"
+            "Check the parts to place this pass, then Place.")),
+            0, wx.ALL, 6)
+        self.place_stage = wx.RadioBox(
+            place_pg, label="Stage",
+            choices=["Subsystem anchors", "Satellites"],
+            majorDimension=1, style=wx.RA_SPECIFY_COLS)
+        plp.Add(self.place_stage, 0, wx.EXPAND | wx.ALL, 6)
+        self.place_list = wx.CheckListBox(place_pg, choices=[])
+        plp.Add(self.place_list, 1, wx.EXPAND | wx.ALL, 6)
+        prow2 = wx.BoxSizer(wx.HORIZONTAL)
+        self.btn_place_all = wx.Button(place_pg, label="All", size=(52, -1))
+        self.btn_place_none = wx.Button(place_pg, label="None", size=(60, -1))
+        prow2.Add(self.btn_place_all, 0, wx.RIGHT, 4)
+        prow2.Add(self.btn_place_none, 0)
+        plp.Add(prow2, 0, wx.LEFT | wx.BOTTOM, 6)
+        self.btn_place = wx.Button(place_pg, label="Place checked")
+        plp.Add(self.btn_place, 0, wx.EXPAND | wx.ALL, 6)
+        place_pg.SetSizer(plp)
+
         self.chk_debug = wx.CheckBox(panel, label="Debug: show A* search heatmap")
         left.Add(self.chk_debug, 0, wx.LEFT | wx.BOTTOM, 8)
 
@@ -615,6 +687,13 @@ class RouterDialog(wx.Dialog):
         self.btn_route.Bind(wx.EVT_BUTTON, self.on_route)
         self.btn_trunk.Bind(wx.EVT_BUTTON, self.on_trunk)
         self.btn_cancel.Bind(wx.EVT_BUTTON, self.on_cancel)
+        self.btn_place.Bind(wx.EVT_BUTTON, self.on_place)
+        self.btn_place_all.Bind(wx.EVT_BUTTON,
+                                lambda e: self._check_place_all(True))
+        self.btn_place_none.Bind(wx.EVT_BUTTON,
+                                 lambda e: self._check_place_all(False))
+        self.place_stage.Bind(wx.EVT_RADIOBOX, lambda e: self._refresh_place_list())
+        self.tabs.Bind(wx.EVT_NOTEBOOK_PAGE_CHANGED, self._on_tab)
         self.btn_try.Bind(wx.EVT_BUTTON, self.on_try_again)
         self.btn_commit.Bind(wx.EVT_BUTTON, self.on_commit)
         self.btn_revert.Bind(wx.EVT_BUTTON, self.on_revert)
@@ -917,6 +996,80 @@ class RouterDialog(wx.Dialog):
         extent = (x0, y0, x0 + nx * pitch, y0 + ny * pitch)
         return extent, img.ConvertToBitmap()
 
+    # --- placement -----------------------------------------------------------
+    def _on_tab(self, _evt):
+        if self.tabs.GetSelection() == 2:      # Place tab
+            self._refresh_place_list()
+
+    def _place_table(self):
+        return placement.effective_table(self.board, self.board.GetFileName())
+
+    def _refresh_place_list(self):
+        """Populate the checklist with the unplaced parts for the current stage."""
+        table = self._place_table()
+        region = placement._board_region(self.board)
+        fps = {fp.GetReference(): fp for fp in self.board.GetFootprints()
+               if fp.GetReference()}
+        want = ("subsystem_anchor" if self.place_stage.GetSelection() == 0
+                else "satellite")
+        refs = []
+        for ref, info in sorted(table.items()):
+            fp = fps.get(ref)
+            if fp is None or info["type"] != want:
+                continue
+            if placement.is_unplaced(fp, region):
+                refs.append(ref)
+        self._place_refs = refs
+        labels = []
+        for r in refs:
+            par = ", ".join(table[r]["parents"]) or "-"
+            labels.append("%s  (%s) -> %s" % (r, table[r]["value"], par))
+        self.place_list.Set(labels)
+        for i in range(len(refs)):
+            self.place_list.Check(i, True)
+        self.btn_place.Enable(bool(refs))
+
+    def _check_place_all(self, on):
+        for i in range(self.place_list.GetCount()):
+            self.place_list.Check(i, on)
+
+    def _checked_place_refs(self):
+        return [self._place_refs[i] for i in range(len(self._place_refs))
+                if self.place_list.IsChecked(i)]
+
+    def on_place(self, _evt):
+        refs = set(self._checked_place_refs())
+        if not refs:
+            wx.MessageBox("Check parts to place first.", "dg-router")
+            return
+        table = self._place_table()
+        stage0 = self.place_stage.GetSelection() == 0
+        if stage0:
+            proposed = placement.place_subsystems(self.board, table)
+        else:
+            proposed = placement.place_satellites(self.board, table)
+        proposed = {r: xy for r, xy in proposed.items() if r in refs}
+        if not proposed:
+            wx.MessageBox("Nothing to place (are anchors/parents placed?).",
+                          "dg-router")
+            return
+        fps = {fp.GetReference(): fp for fp in self.board.GetFootprints()
+               if fp.GetReference()}
+        ghosts = []
+        for ref, (x, y) in proposed.items():
+            w, h = placement._fp_size(fps[ref])
+            ghosts.append({"ref": ref, "x": x, "y": y, "w": w, "h": h})
+        self._place_proposed = proposed
+        self._proposal = "place"
+        self.preview.set_placements(ghosts)
+        xs = [g["x"] for g in ghosts]
+        ys = [g["y"] for g in ghosts]
+        self.preview.zoom_to_bbox(min(xs) - 5, min(ys) - 5,
+                                  max(xs) + 5, max(ys) + 5)
+        self.status.SetLabel("Proposed %d placements — Accept / Reject"
+                             % len(ghosts))
+        self._show_actions(True)
+
     def _route_net_ui(self, done, total, result):
         self._shown.append(result)
         self.preview.set_proposed(list(self._shown))
@@ -988,12 +1141,48 @@ class RouterDialog(wx.Dialog):
         self._compute(0.35)
 
     def on_revert(self, _evt):
+        if self._proposal == "place":
+            self._place_proposed = {}
+            self._proposal = None
+            self.preview.set_placements([])
+            self.status.SetLabel("Rejected placements.")
+            self._show_actions(False)
+            self._refresh_place_list()
+            return
         self.proposed = []
         self.preview.set_proposed([])
         self.status.SetLabel("Rejected. Pick nets and Route again.")
         self._reset_pass()
 
+    def _commit_placements(self):
+        _NM = 1e6
+        fps = {fp.GetReference(): fp for fp in self.board.GetFootprints()
+               if fp.GetReference()}
+        n = 0
+        for ref, (x, y) in self._place_proposed.items():
+            fp = fps.get(ref)
+            if fp:
+                fp.SetPosition(pcbnew.VECTOR2I(int(x * _NM), int(y * _NM)))
+                n += 1
+        self._place_proposed = {}
+        self._proposal = None
+        self.preview.set_placements([])
+        self._refresh_canvas()
+        # parts moved -> re-render the preview from a temp copy (never the real file)
+        tmp = os.path.join(tempfile.gettempdir(), "dg-place-preview.kicad_pcb")
+        try:
+            pcbnew.SaveBoard(tmp, self.board)
+            self.preview.rerender(tmp)
+        except Exception:
+            pass
+        self._show_actions(False)
+        self._refresh_place_list()
+        self.status.SetLabel("Placed %d parts (Cmd+S to save)." % n)
+
     def on_commit(self, _evt):
+        if self._proposal == "place":
+            self._commit_placements()
+            return
         added = 0
         committed = []
         for r in self.proposed:
