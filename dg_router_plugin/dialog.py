@@ -632,6 +632,7 @@ class RouterDialog(wx.Dialog):
         leftp = wx.Panel(panel)
         leftp.SetMinSize((380, -1))
         leftp.SetMaxSize((400, -1))
+        self.leftp = leftp
         left = wx.BoxSizer(wx.VERTICAL)
 
         # === tabs at the TOP; each tab owns its whole panel ===
@@ -1056,11 +1057,24 @@ class RouterDialog(wx.Dialog):
             prefer_layer=(None if pf == "(any)" else pf))
 
     def _refresh_canvas(self):
+        # rebuild connectivity, then force KiCad to repaint. Separate try blocks
+        # so a connectivity hiccup can't swallow the repaint; also repaint again
+        # deferred, since a mid-handler Refresh doesn't always redraw moved parts.
         try:
             self.board.BuildConnectivity()
+        except Exception:
+            pass
+        try:
             pcbnew.Refresh()
         except Exception:
             pass
+
+        def _again():
+            try:
+                pcbnew.Refresh()
+            except Exception:
+                pass
+        wx.CallAfter(_again)
 
     def _job_unconn(self):
         """The current job as a {net: [gaps]} subset for route_batch."""
@@ -1182,15 +1196,12 @@ class RouterDialog(wx.Dialog):
         # keeps the preview.
         place = self.tabs.GetSelection() == 2
         self.panel.GetSizer().Show(self.preview, not place)  # frees its space
+        # on Place the preview is gone, so let the controls fill the full width;
+        # on Route cap the left column so the preview keeps its room
+        self.leftp.SetMaxSize((-1, -1) if place else (400, -1))
         self.panel.Layout()
-        h = self.GetSize().height
-        if place:
-            if self.GetSize().width > 520:
-                self.SetSize((430, h))
-            if self._loaded:
-                self._refresh_place_all()
-        elif self.GetSize().width < 700:
-            self.SetSize((1040, h))
+        if place and self._loaded:
+            self._refresh_place_all()
 
     def _on_ptab(self, _evt):
         if self._loaded:
