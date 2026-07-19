@@ -622,6 +622,7 @@ class RouterDialog(wx.Dialog):
         self._anchor_refs = []
         self._allsat_refs = []
         self._place_table_cache = {}
+        self._undo_positions = {}   # ref -> old (x_nm,y_nm) for Undo
         self._place_proposed = {}   # ref -> (x,y) proposed positions
 
         panel = wx.Panel(self)
@@ -734,11 +735,14 @@ class RouterDialog(wx.Dialog):
         prow = wx.BoxSizer(wx.HORIZONTAL)
         self.btn_edit_table = wx.Button(place_pg, label="Component table…",
                                         size=(140, -1))
+        self.btn_undo_place = wx.Button(place_pg, label="Undo", size=(60, -1))
         self.btn_reclassify = wx.Button(place_pg, label="Re-infer", size=(80, -1))
         prow.Add(self.btn_edit_table, 0, wx.RIGHT, 6)
         prow.AddStretchSpacer(1)
+        prow.Add(self.btn_undo_place, 0, wx.RIGHT, 4)
         prow.Add(self.btn_reclassify, 0)
         plp.Add(prow, 0, wx.EXPAND | wx.ALL, 8)
+        self.btn_undo_place.Disable()
 
         self.ptabs = wx.Notebook(place_pg)
         anchors_pg = wx.Panel(self.ptabs)
@@ -861,6 +865,7 @@ class RouterDialog(wx.Dialog):
         self.btn_sat_all.Bind(wx.EVT_BUTTON, self.on_place_sat_all)
         self.btn_reclassify.Bind(wx.EVT_BUTTON, self.on_reclassify)
         self.btn_edit_table.Bind(wx.EVT_BUTTON, self.on_edit_table)
+        self.btn_undo_place.Bind(wx.EVT_BUTTON, self.on_undo_place)
         self.subsys_list.Bind(wx.EVT_LIST_ITEM_SELECTED, self._on_subsys_select)
         self.subsys_list.Bind(wx.EVT_LIST_ITEM_DESELECTED, self._on_subsys_select)
         self.ptabs.Bind(wx.EVT_NOTEBOOK_PAGE_CHANGED, self._on_ptab)
@@ -1329,26 +1334,41 @@ class RouterDialog(wx.Dialog):
         self.status.SetLabel("Re-inferred subsystems.")
 
     def _propose_placements(self, proposed, what):
+        """Place directly into KiCad (no ghost/accept) — you tweak in the canvas,
+        then place the next. Remembers prior positions so 'Undo' can restore."""
         if not proposed:
             wx.MessageBox("Nothing to place — place the subsystem's anchor "
                           "first, then its satellites.", "dg-router")
             return
+        _NM = 1e6
         fps = {fp.GetReference(): fp for fp in self.board.GetFootprints()
                if fp.GetReference()}
-        ghosts = [{"ref": r, "x": x, "y": y,
-                   "w": placement._fp_size(fps[r])[0],
-                   "h": placement._fp_size(fps[r])[1]}
-                  for r, (x, y) in proposed.items() if r in fps]
-        self._place_proposed = proposed
-        self._proposal = "place"
-        self.preview.set_placements(ghosts)
-        xs = [g["x"] for g in ghosts]
-        ys = [g["y"] for g in ghosts]
-        self.preview.zoom_to_bbox(min(xs) - 5, min(ys) - 5,
-                                  max(xs) + 5, max(ys) + 5)
-        self.status.SetLabel("Proposed %d %s — Accept / Reject"
-                             % (len(ghosts), what))
-        self._show_actions(True)
+        self._undo_positions = {}
+        n = 0
+        for ref, (x, y) in proposed.items():
+            fp = fps.get(ref)
+            if not fp:
+                continue
+            p = fp.GetPosition()
+            self._undo_positions[ref] = (p.x, p.y)
+            fp.SetPosition(pcbnew.VECTOR2I(int(x * _NM), int(y * _NM)))
+            n += 1
+        self._refresh_canvas()          # KiCad canvas now shows the moved parts
+        self._refresh_place_all()
+        self.btn_undo_place.Enable(bool(self._undo_positions))
+        self.status.SetLabel("Placed %d %s — nudge in KiCad, then place the next "
+                             "(Cmd+S to save; or Undo)." % (n, what))
+
+    def on_undo_place(self, _evt):
+        for ref, (x, y) in self._undo_positions.items():
+            fp = self.board.FindFootprintByReference(ref)
+            if fp:
+                fp.SetPosition(pcbnew.VECTOR2I(x, y))
+        self._undo_positions = {}
+        self._refresh_canvas()
+        self._refresh_place_all()
+        self.btn_undo_place.Disable()
+        self.status.SetLabel("Undid last placement.")
 
     def on_place_anchor(self, _evt):
         refs = set(self._selected_subsys_refs())
