@@ -799,6 +799,9 @@ class RouterDialog(wx.Dialog):
         self.sat_list.InsertColumn(2, "Size(mm)", width=62)
         self.sat_list.InsertColumn(3, "Placed", width=46)
         sp.Add(self.sat_list, 1, wx.EXPAND | wx.ALL, 6)
+        self.btn_place_one = wx.Button(
+            subs_pg, label="Place selected satellite(s)")
+        sp.Add(self.btn_place_one, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 6)
         subs_pg.SetSizer(sp)
 
         # Satellites page (flat, grouped by subsystem)
@@ -859,6 +862,7 @@ class RouterDialog(wx.Dialog):
         self.btn_cancel.Bind(wx.EVT_BUTTON, self.on_cancel)
         self.btn_place_anchor.Bind(wx.EVT_BUTTON, self.on_place_anchor)
         self.btn_place_sats.Bind(wx.EVT_BUTTON, self.on_place_satellites)
+        self.btn_place_one.Bind(wx.EVT_BUTTON, self.on_place_one_sat)
         self.btn_anchor_sel.Bind(wx.EVT_BUTTON, self.on_place_anchors_sel)
         self.btn_anchor_all.Bind(wx.EVT_BUTTON, self.on_place_anchors_all)
         self.btn_sat_sel.Bind(wx.EVT_BUTTON, self.on_place_sat_sel)
@@ -1199,7 +1203,7 @@ class RouterDialog(wx.Dialog):
         szr.GetItem(self.leftp).SetProportion(1 if place else 0)
         self.leftp.SetMaxSize((-1, -1) if place else (400, -1))
         self.panel.Layout()
-        self.SetSize((660 if place else 1040, self.GetSize().height))
+        self.SetSize((500 if place else 1040, self.GetSize().height))
         self.panel.Layout()
         if place and self._loaded:
             self._refresh_place_all()
@@ -1344,6 +1348,7 @@ class RouterDialog(wx.Dialog):
         r0 = refs[0]
         name = table[r0].get("name") or r0
         sats = placement.satellites_of(table, r0)
+        self._sat_detail_refs = sats
         self.sat_label.SetLabel("Satellites of %s (%d):" % (name, len(sats)))
         for s in sats:
             fp = fps.get(s)
@@ -1446,6 +1451,20 @@ class RouterDialog(wx.Dialog):
         proposed = {r: xy for r, xy in placement.place_satellites(
             self.board, table, reposition=want).items() if r in want}
         self._propose_placements(proposed, "satellite(s)", requested=len(want))
+
+    def on_place_one_sat(self, _evt):
+        # place just the satellite(s) selected in the detail list — one at a time
+        refs = set(self._selected_rows(self.sat_list,
+                                       getattr(self, "_sat_detail_refs", [])))
+        if not refs:
+            wx.MessageBox("Select satellite(s) in the list below first.",
+                          "dg-router")
+            return
+        t = self._place_table()
+        self._propose_placements(
+            {r: xy for r, xy in placement.place_satellites(
+                self.board, t, reposition=refs).items() if r in refs},
+            "satellite(s)", requested=len(refs))
 
     def on_place_all_anchors(self, _evt):
         table = self._place_table()

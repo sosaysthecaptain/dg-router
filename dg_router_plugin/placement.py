@@ -414,9 +414,9 @@ def place_satellites(board, table, reposition=None):
     return proposed
 
 
-def _spiral_free(tx, ty, w, h, placed, region, m):
-    """Nearest grid position to (tx,ty) whose reserved box clears all placed
-    boxes and stays in the board. Expanding-ring search."""
+def _spiral_free(tx, ty, w, h, placed, region, m, gap=0.6):
+    """Nearest grid position to (tx,ty) whose box (+gap for fanout room) clears
+    all placed boxes and stays in the board. Expanding-ring search."""
     rx0, ry0, rx1, ry1 = region
     step = 1.0
 
@@ -425,7 +425,7 @@ def _spiral_free(tx, ty, w, h, placed, region, m):
                 ry0 + h / 2 + m <= y <= ry1 - h / 2 - m):
             return False
         for (px, py, pw, ph) in placed:
-            if _overlap(x, y, w, h, px, py, pw, ph):
+            if _overlap(x, y, w, h, px, py, pw, ph, gap):
                 return False
         return True
 
