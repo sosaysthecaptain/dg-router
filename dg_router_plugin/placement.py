@@ -64,7 +64,13 @@ def classify(board):
     dominates a 100-pad GND net (tells you nothing). Satellites parent onto
     subsystem-anchors or anchors; subsystem-anchors parent onto anchors.
     """
+    import pcbnew
     comp_nets, net_size, fps = _component_nets(board)
+    code_name = {}
+    for code in range(1, board.GetNetCount()):
+        nn = board.FindNet(code)
+        if nn is not None:
+            code_name[code] = nn.GetNetname()
     types = {ref: _infer_type(_prefix(ref), fp.GetPadCount())
              for ref, fp in fps.items()}
     anchors = {r for r, t in types.items() if t == "anchor"}
@@ -89,12 +95,34 @@ def classify(board):
                 scores[c] = s
         parents = []
         if scores:
-            best = max(scores.values())
-            parents = [c for c, s in sorted(scores.items(), key=lambda x: -x[1])
-                       if s >= best * 0.5][:2]
+            ranked = [c for c, _ in sorted(scores.items(), key=lambda x: -x[1])]
+            # a satellite belongs to ONE subsystem; a subsystem anchor may relate
+            # to a couple of anchors
+            parents = ranked[:1] if t == "satellite" else \
+                [c for c in ranked if scores[c] >= max(scores.values()) * 0.5][:2]
         out[ref] = {"type": t, "parents": parents,
-                    "value": fp.GetValue(), "name": fp.GetValue(),
-                    "pads": fp.GetPadCount()}
+                    "value": fp.GetValue(), "pads": fp.GetPadCount()}
+
+    # human names: anchors/subsystems keep their value; a satellite becomes
+    # "<subsystem> <signal>" from the lowest-fanout net it shares with its parent
+    for ref, info in out.items():
+        if info["type"] != "satellite" or not info["parents"]:
+            out[ref]["name"] = info["value"]
+            continue
+        par = info["parents"][0]
+        pname = out.get(par, {}).get("value") or par
+        shared = comp_nets[ref] & comp_nets[par]
+        best_nc, best_sz = None, 1e9
+        for nc in shared:
+            if net_size.get(nc, 1e9) < best_sz:
+                best_sz, best_nc = net_size[nc], nc
+        if best_nc is not None and best_sz <= 6:
+            nn = code_name.get(best_nc, "").lstrip("/")
+            short = nn.split("_")[-1] if "_" in nn else nn
+            out[ref]["name"] = ("%s %s" % (pname, short)) if short \
+                else "%s %s" % (pname, info["value"])
+        else:
+            out[ref]["name"] = "%s %s" % (pname, info["value"])
     return out
 
 

@@ -546,11 +546,19 @@ class ComponentTableDialog(wx.Dialog):
         g.Bind(wx.grid.EVT_GRID_CELL_CHANGED, self._on_edit)
         s = wx.BoxSizer(wx.VERTICAL)
         s.Add(g, 1, wx.EXPAND | wx.ALL, 6)
-        b = wx.Button(self, wx.ID_CLOSE, "Close")
-        b.Bind(wx.EVT_BUTTON, lambda e: self.Close())
+        b = wx.Button(self, wx.ID_ANY, "Close")
+        b.Bind(wx.EVT_BUTTON, self._do_close)
         s.Add(b, 0, wx.ALIGN_RIGHT | wx.ALL, 6)
         self.SetSizer(s)
-        self.Bind(wx.EVT_CLOSE, self._on_close)
+        self.Bind(wx.EVT_CLOSE, lambda e: self._do_close(e))
+
+    def _do_close(self, _evt):
+        try:
+            if self.on_changed:
+                self.on_changed()
+        except Exception:
+            pass
+        self.Destroy()
 
     def _populate(self):
         t = placement.effective_table(self.board, self.bp)
@@ -594,12 +602,6 @@ class ComponentTableDialog(wx.Dialog):
                                   if p.strip()]
             placement.save_table(self.bp, saved)
         evt.Skip()
-
-    def _on_close(self, evt):
-        if self.on_changed:
-            self.on_changed()
-        evt.Skip()
-
 
 class RouterDialog(wx.Dialog):
     def __init__(self, board):
