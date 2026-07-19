@@ -789,8 +789,10 @@ class RouterDialog(wx.Dialog):
         srow = wx.BoxSizer(wx.HORIZONTAL)
         self.btn_place_anchor = wx.Button(subs_pg, label="Place anchor")
         self.btn_place_sats = wx.Button(subs_pg, label="Place satellites")
+        self.btn_show_nets = wx.Button(subs_pg, label="Show nets")
         srow.Add(self.btn_place_anchor, 1, wx.RIGHT, 6)
-        srow.Add(self.btn_place_sats, 1)
+        srow.Add(self.btn_place_sats, 1, wx.RIGHT, 6)
+        srow.Add(self.btn_show_nets, 1)
         sp.Add(wx.StaticText(subs_pg, label="Selected subsystem(s):"),
                0, wx.LEFT, 6)
         sp.Add(srow, 0, wx.EXPAND | wx.ALL, 6)
@@ -844,6 +846,10 @@ class RouterDialog(wx.Dialog):
         nrow.Add(self.btn_nets_all, 0, wx.RIGHT, 6)
         nrow.Add(self.btn_nets_none, 0)
         np.Add(nrow, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 6)
+
+        self.net_filter = wx.TextCtrl(nets_pg, style=wx.TE_PROCESS_ENTER)
+        self.net_filter.SetHint("Filter…")
+        np.Add(self.net_filter, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 6)
 
         self.net_group_list = wx.ListCtrl(nets_pg, style=wx.LC_REPORT)
         self.net_group_list.EnableCheckBoxes(True)
@@ -899,6 +905,7 @@ class RouterDialog(wx.Dialog):
         self.btn_cancel.Bind(wx.EVT_BUTTON, self.on_cancel)
         self.btn_place_anchor.Bind(wx.EVT_BUTTON, self.on_place_anchor)
         self.btn_place_sats.Bind(wx.EVT_BUTTON, self.on_place_satellites)
+        self.btn_show_nets.Bind(wx.EVT_BUTTON, self.on_show_subsys_nets)
         self.btn_place_one.Bind(wx.EVT_BUTTON, self.on_place_one_sat)
         self.btn_anchor_sel.Bind(wx.EVT_BUTTON, self.on_place_anchors_sel)
         self.btn_anchor_all.Bind(wx.EVT_BUTTON, self.on_place_anchors_all)
@@ -919,7 +926,8 @@ class RouterDialog(wx.Dialog):
         self.btn_none.Bind(wx.EVT_BUTTON, lambda e: self._check_all(False))
         self.btn_nets_all.Bind(wx.EVT_BUTTON, lambda e: self.on_nets_show_all(True))
         self.btn_nets_none.Bind(wx.EVT_BUTTON, lambda e: self.on_nets_show_all(False))
-        self.net_mode.Bind(wx.EVT_CHOICE, lambda e: self._refresh_nets())
+        self.net_mode.Bind(wx.EVT_CHOICE, lambda e: self._refresh_nets(regroup=True))
+        self.net_filter.Bind(wx.EVT_TEXT, lambda e: self._refresh_nets())
         self.net_group_list.Bind(wx.EVT_LIST_ITEM_CHECKED, self._on_net_check)
         self.net_group_list.Bind(wx.EVT_LIST_ITEM_UNCHECKED, self._on_net_check)
         self.btn_net_hl.Bind(wx.EVT_BUTTON, self.on_net_highlight)
@@ -1254,7 +1262,7 @@ class RouterDialog(wx.Dialog):
         if place and self._loaded:
             self._refresh_place_all()
         if sel == 3 and self._loaded:
-            self._refresh_nets()
+            self._refresh_nets(regroup=True)
 
     def _on_ptab(self, _evt):
         if self._loaded:
@@ -1295,28 +1303,58 @@ class RouterDialog(wx.Dialog):
                 groups.append((label, [r], netcount([r])))
         return groups
 
-    def _refresh_nets(self):
-        # ensure the global ratsnest layer is on, else nothing shows regardless
+    def _ensure_ratsnest_snapshot(self):
+        """Remember the board's ratsnest state the first time we touch it, so we
+        can put everything back to normal when the dialog closes — the tool does
+        its thing, then gets out of the way."""
+        if getattr(self, "_ratsnest_snapshot", None) is not None:
+            return
+        snap = {}
+        for fp in self.board.GetFootprints():
+            for i, pad in enumerate(fp.Pads()):
+                snap[(fp.GetReference(), i)] = pad.GetLocalRatsnestVisible()
+        self._ratsnest_snapshot = snap
+
+    def _restore_ratsnest(self):
+        """Put ratsnest visibility + highlight back exactly as we found them."""
+        snap = getattr(self, "_ratsnest_snapshot", None)
+        if snap is None:
+            return
+        for fp in self.board.GetFootprints():
+            ref = fp.GetReference()
+            for i, pad in enumerate(fp.Pads()):
+                if (ref, i) in snap:
+                    pad.SetLocalRatsnestVisible(snap[(ref, i)])
         try:
-            self.board.SetElementVisibility(pcbnew.LAYER_RATSNEST, True)
+            self.board.ResetNetHighLight()
         except Exception:
             pass
-        self._net_group_refs = self._net_groups()
-        L = self.net_group_list
-        L.DeleteAllItems()
+        self._ratsnest_snapshot = None
+        self._refresh_canvas()
+
+    def _refresh_nets(self, regroup=False):
+        # (re)compute the groups only when needed (mode change / first entry);
+        # filtering just re-filters the cached list. Never touches global ratsnest
+        # or fires per-row toggles (that caused the spin/crash + "all" takeover).
+        if regroup or getattr(self, "_net_all_groups", None) is None:
+            self._net_all_groups = self._net_groups()
+        needle = self.net_filter.GetValue().strip().lower()
+        groups = [g for g in self._net_all_groups
+                  if not needle or needle in g[0].lower()]
+        self._net_group_refs = groups
         fps = {fp.GetReference(): fp for fp in self.board.GetFootprints()
                if fp.GetReference()}
-        for label, refs, ncount in self._net_group_refs:
+        self._nets_updating = True          # guard: programmatic checks below
+        L = self.net_group_list
+        L.DeleteAllItems()
+        for label, refs, ncount in groups:
             row = L.InsertItem(L.GetItemCount(), label)
             L.SetItem(row, 1, str(ncount))
-            # reflect current visibility: checked if any pad in the group is shown
-            shown = False
-            for r in refs:
-                fp = fps.get(r)
-                if fp and any(p.GetLocalRatsnestVisible() for p in fp.Pads()):
-                    shown = True
-                    break
+            shown = any(fps.get(r) and
+                        any(p.GetLocalRatsnestVisible() for p in fps[r].Pads())
+                        for r in refs)
             L.CheckItem(row, shown)
+        self._nets_updating = False
 
     def _set_group_ratsnest(self, refs, visible):
         fps = {fp.GetReference(): fp for fp in self.board.GetFootprints()
@@ -1329,23 +1367,25 @@ class RouterDialog(wx.Dialog):
                 pad.SetLocalRatsnestVisible(visible)
 
     def _on_net_check(self, evt):
+        if getattr(self, "_nets_updating", False):
+            return                          # ignore checks we set programmatically
         idx = evt.GetIndex()
         if idx < 0 or idx >= len(getattr(self, "_net_group_refs", [])):
             return
+        self._ensure_ratsnest_snapshot()
         _, refs, _ = self._net_group_refs[idx]
         self._set_group_ratsnest(refs, self.net_group_list.IsItemChecked(idx))
         self._refresh_canvas()
 
     def on_nets_show_all(self, visible):
-        try:
-            self.board.SetElementVisibility(pcbnew.LAYER_RATSNEST, True)
-        except Exception:
-            pass
+        self._ensure_ratsnest_snapshot()
         for fp in self.board.GetFootprints():
             for pad in fp.Pads():
                 pad.SetLocalRatsnestVisible(visible)
+        self._nets_updating = True
         for i in range(self.net_group_list.GetItemCount()):
             self.net_group_list.CheckItem(i, visible)
+        self._nets_updating = False
         self._refresh_canvas()
         self.status.SetLabel("Ratsnest: %s all." % ("showing" if visible else "hidden"))
 
@@ -1485,6 +1525,8 @@ class RouterDialog(wx.Dialog):
         subs = sorted((r for r, i in table.items()
                        if i["type"] == "subsystem_anchor"),
                       key=lambda r: (table[r].get("name") or r).lower())
+        keep = set(self._selected_subsys_refs()) if getattr(
+            self, "_subsys_refs", None) else set()
         self._subsys_refs = subs
         L = self.subsys_list
         L.DeleteAllItems()
@@ -1499,6 +1541,8 @@ class RouterDialog(wx.Dialog):
             L.SetItem(row, 2, str(placement._connected_pins(fp)) if fp else "0")
             L.SetItem(row, 3, str(len(placement.satellites_of(table, r))))
             L.SetItem(row, 4, "yes" if placed else "no")
+            if r in keep:                   # preserve selection across refresh
+                L.Select(row)
         self._refresh_sat_detail()
 
     def _selected_subsys_refs(self):
@@ -1537,6 +1581,63 @@ class RouterDialog(wx.Dialog):
 
     def _on_subsys_select(self, _evt):
         self._refresh_sat_detail()
+        # brighten the selected subsystem (chip + its satellites) in the canvas
+        refs = self._selected_subsys_refs()
+        table = getattr(self, "_place_table_cache", {})
+        show = []
+        for r in refs:
+            show.append(r)
+            show += placement.satellites_of(table, r)
+        self._highlight_footprints(show)
+
+    def _highlight_footprints(self, refs):
+        """Brighten the given footprints in KiCad's canvas; clears any prior."""
+        self._clear_canvas_highlight()
+        fps = {fp.GetReference(): fp for fp in self.board.GetFootprints()
+               if fp.GetReference()}
+        done = []
+        for r in refs:
+            fp = fps.get(r)
+            if fp:
+                try:
+                    fp.SetBrightened()
+                    done.append(fp)
+                except Exception:
+                    pass
+        self._brightened = done
+        self._refresh_canvas()
+
+    def _clear_canvas_highlight(self):
+        for fp in getattr(self, "_brightened", []):
+            try:
+                fp.ClearBrightened()
+            except Exception:
+                pass
+        self._brightened = []
+
+    def _focus_subsystem_nets(self, subsys_refs):
+        """Show ONLY the ratsnest of the given subsystem(s) (chip + satellites);
+        hide everything else. Restores to normal when the dialog closes."""
+        self._ensure_ratsnest_snapshot()
+        table = getattr(self, "_place_table_cache", None) or self._place_table()
+        keep = set()
+        for r in subsys_refs:
+            keep.add(r)
+            keep.update(placement.satellites_of(table, r))
+        for fp in self.board.GetFootprints():
+            vis = fp.GetReference() in keep
+            for pad in fp.Pads():
+                pad.SetLocalRatsnestVisible(vis)
+        self._refresh_canvas()
+
+    def on_show_subsys_nets(self, _evt):
+        refs = self._selected_subsys_refs()
+        if not refs:
+            wx.MessageBox("Select a subsystem first.", "dg-router")
+            return
+        self._focus_subsystem_nets(refs)
+        self.status.SetLabel(
+            "Showing only %s nets — closes back to normal." % ", ".join(refs))
 
     def on_edit_table(self, _evt):
         """Open the full component table (Ref/Name/Value/Type/Parents) in a wide
@@ -1619,6 +1720,7 @@ class RouterDialog(wx.Dialog):
         proposed = {r: xy for r, xy in placement.place_subsystems(
             self.board, table, reposition=refs).items() if r in refs}
         self._propose_placements(proposed, "anchor(s)", requested=len(refs))
+        self._focus_subsystem_nets(refs)    # show just this subsystem's nets
 
     def on_place_satellites(self, _evt):
         refs = self._selected_subsys_refs()
@@ -1830,6 +1932,8 @@ class RouterDialog(wx.Dialog):
         self._text_dialog("Agent instructions — %s" % doc, text)
 
     def on_close(self, _evt):
+        self._restore_ratsnest()            # leave the board's nets as we found them
+        self._clear_canvas_highlight()
         if self in _OPEN:
             _OPEN.remove(self)
         self.Destroy()
