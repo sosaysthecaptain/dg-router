@@ -604,6 +604,89 @@ def place_subsystem_cluster(board, table, ref, origin=None, anchor_deg=None):
     return proposed
 
 
+def stragglers_of(board, table, ref):
+    """Satellites of subsystem `ref` that aren't home with their cluster: sitting
+    farther from the anchor than a freshly-arranged cluster would put them.
+    Distance-only (NOT board-region), so it's right whether the cluster is parked
+    off-board or dropped on it. Returns [refs]. Empty if the anchor is missing."""
+    fps = {fp.GetReference(): fp for fp in board.GetFootprints()
+           if fp.GetReference()}
+    if ref not in fps:
+        return []
+    acx, acy, _, _ = _fp_box(fps[ref])
+    sats = [s for s in satellites_of(table, ref) if s in fps]
+    if not sats:
+        return []
+    # home radius = how far a fresh cluster reaches from the anchor, + slack
+    fresh = place_subsystem_cluster(board, table, ref, origin=(acx, acy))
+    reach = 0.0
+    for s in sats:
+        if s in fresh:
+            fx, fy, _ = fresh[s]
+            reach = max(reach, math.hypot(fx - acx, fy - acy))
+    # A straggler is a FAR outlier, not merely a looser-than-ideal layout. Judge
+    # generously: 1.3x the ideal cluster reach, with a 35mm floor so a compact
+    # real (hand/router) layout is never flagged. True limbo/dragged-away parts
+    # sit far beyond this.
+    home = max(1.3 * reach + 6.0, 35.0)
+    out = []
+    for s in sats:
+        p = fps[s].GetPosition()
+        if math.hypot(p.x / _NM - acx, p.y / _NM - acy) > home:
+            out.append(s)
+    return out
+
+
+def gather_stragglers(board, table, ref):
+    """Retrieve subsystem `ref`'s straggling satellites: place them into the ranks
+    around the anchor at its CURRENT position, treating everything already on the
+    board (including the home satellites) as fixed obstacles. Returns
+    {ref:(x,y,deg)} for the ones it could fit (partial if the area is tight)."""
+    region = _board_region(board)
+    fps = {fp.GetReference(): fp for fp in board.GetFootprints()
+           if fp.GetReference()}
+    if ref not in fps or is_unplaced(fps[ref], region):
+        return {}
+    strag = set(stragglers_of(board, table, ref))
+    if not strag:
+        return {}
+    cn, net_size, _ = _component_nets(board)
+    obstacles = []
+    for r, fp in fps.items():
+        if r in strag or is_unplaced(fp, region):
+            continue
+        cx, cy, w, h = _fp_box(fp)
+        obstacles.append([cx, cy, w, h, _fanout_halo(fp)])
+
+    pcx, pcy, pw, ph = _fp_box(fps[ref])
+    H = _fanout_halo(fps[ref])
+    byside, meta = {}, {}
+    for s in strag:
+        tgt = _sat_target(board, s, table[s], fps, cn, net_size, region)
+        if tgt is None:
+            continue
+        _, px, py, nc = tgt
+        dx, dy = px - pcx, py - pcy
+        phw, phh = max(pw / 2.0, 0.1), max(ph / 2.0, 0.1)
+        if abs(dx) / phw >= abs(dy) / phh:
+            side = "R" if dx >= 0 else "L"
+        else:
+            side = "B" if dy >= 0 else "T"
+        meta[s] = (nc, px, py)
+        byside.setdefault(side, []).append(s)
+
+    proposed = {}
+    for side, group in byside.items():
+        vert = side in ("L", "R")
+        items = []
+        for s in group:
+            nc, px, py = meta[s]
+            deg = _sat_orientation(fps[s], nc, side)
+            items.append(_make_item(s, fps, deg, py if vert else px))
+        _place_rank(side, items, pcx, pcy, pw, ph, H, region, obstacles, proposed)
+    return proposed
+
+
 def _place_rank(side, items, pcx, pcy, pw, ph, H, region, obstacles, proposed):
     """Lay one chip edge's satellites in a straight, aligned, evenly-pitched rank
     near the pins they serve. `items` are pre-built dicts {ref,deg,w,h,want,halo}.

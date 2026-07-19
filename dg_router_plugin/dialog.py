@@ -807,11 +807,14 @@ class RouterDialog(wx.Dialog):
         self.sat_list.InsertColumn(1, "Name", width=190)
         self.sat_list.InsertColumn(2, "Size(mm)", width=62)
         self.sat_list.InsertColumn(3, "Pins", width=42)
-        self.sat_list.InsertColumn(4, "Placed", width=46)
+        self.sat_list.InsertColumn(4, "Status", width=54)
         sp.Add(self.sat_list, 1, wx.EXPAND | wx.ALL, 6)
-        self.btn_place_one = wx.Button(
-            subs_pg, label="Place selected satellite(s)")
-        sp.Add(self.btn_place_one, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 6)
+        satbtns = wx.BoxSizer(wx.HORIZONTAL)
+        self.btn_place_one = wx.Button(subs_pg, label="Place selected")
+        self.btn_retrieve = wx.Button(subs_pg, label="Retrieve stragglers")
+        satbtns.Add(self.btn_place_one, 1, wx.RIGHT, 6)
+        satbtns.Add(self.btn_retrieve, 1)
+        sp.Add(satbtns, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 6)
 
         # plunk the whole subsystem down as one draggable mass
         sp.Add(wx.StaticLine(subs_pg), 0, wx.EXPAND | wx.ALL, 4)
@@ -947,6 +950,7 @@ class RouterDialog(wx.Dialog):
         self.btn_show_nets.Bind(wx.EVT_BUTTON, self.on_show_subsys_nets)
         self.btn_place_cluster.Bind(wx.EVT_BUTTON, self.on_place_cluster)
         self.btn_place_one.Bind(wx.EVT_BUTTON, self.on_place_one_sat)
+        self.btn_retrieve.Bind(wx.EVT_BUTTON, self.on_retrieve_stragglers)
         self.btn_anchor_sel.Bind(wx.EVT_BUTTON, self.on_place_anchors_sel)
         self.btn_anchor_all.Bind(wx.EVT_BUTTON, self.on_place_anchors_all)
         self.btn_sat_sel.Bind(wx.EVT_BUTTON, self.on_place_sat_sel)
@@ -1664,7 +1668,11 @@ class RouterDialog(wx.Dialog):
         name = table[r0].get("name") or r0
         sats = placement.satellites_of(table, r0)
         self._sat_detail_refs = sats
-        self.sat_label.SetLabel("Satellites of %s (%d):" % (name, len(sats)))
+        strag = set(placement.stragglers_of(self.board, table, r0))
+        label = "Satellites of %s (%d)" % (name, len(sats))
+        if strag:
+            label += " — %d straggling" % len(strag)
+        self.sat_label.SetLabel(label + ":")
         for s in sats:
             fp = fps.get(s)
             placed = fp is not None and not placement.is_unplaced(fp, region)
@@ -1675,7 +1683,7 @@ class RouterDialog(wx.Dialog):
             self.sat_list.SetItem(row, 2, "%.1f×%.1f" % (w, h))
             self.sat_list.SetItem(row, 3,
                                   str(placement._connected_pins(fp)) if fp else "0")
-            self.sat_list.SetItem(row, 4, "yes" if placed else "no")
+            self.sat_list.SetItem(row, 4, "stray" if s in strag else "home")
 
     def _on_subsys_select(self, _evt):
         self._refresh_sat_detail()
@@ -1792,6 +1800,29 @@ class RouterDialog(wx.Dialog):
         self.status.SetLabel(
             "Placed %s + satellites as one selected mass (its nets shown) — "
             "drag it into place, tweak, then route." % refs[0])
+
+    def on_retrieve_stragglers(self, _evt):
+        refs = self._selected_subsys_refs()
+        if not refs:
+            wx.MessageBox("Select a subsystem first.", "dg-router")
+            return
+        ref = refs[0]
+        region = placement._board_region(self.board)
+        fp = self.board.FindFootprintByReference(ref)
+        if fp is None or placement.is_unplaced(fp, region):
+            wx.MessageBox("Place %s (the subsystem) first — stragglers are "
+                          "gathered around the anchor's current spot." % ref,
+                          "dg-router")
+            return
+        table = self._place_table()
+        strag = placement.stragglers_of(self.board, table, ref)
+        if not strag:
+            self.status.SetLabel(
+                "No stragglers for %s — every satellite is home." % ref)
+            return
+        prop = placement.gather_stragglers(self.board, table, ref)
+        self._propose_placements(prop, "straggler(s)", requested=len(strag))
+        self._select_footprints(list(prop.keys()))
 
     def on_edit_table(self, _evt):
         """Open the full component table (Ref/Name/Value/Type/Parents) in a wide
