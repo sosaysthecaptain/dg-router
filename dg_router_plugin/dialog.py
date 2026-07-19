@@ -763,8 +763,9 @@ class RouterDialog(wx.Dialog):
         # Anchors page (usually hand-placed; edge-aware auto-place is a starter)
         ap = wx.BoxSizer(wx.VERTICAL)
         self.anchor_list = wx.ListCtrl(anchors_pg, style=wx.LC_REPORT)
-        self.anchor_list.InsertColumn(0, "Anchor", width=250)
-        self.anchor_list.InsertColumn(1, "Placed", width=60)
+        self.anchor_list.InsertColumn(0, "Anchor", width=210)
+        self.anchor_list.InsertColumn(1, "Size(mm)", width=66)
+        self.anchor_list.InsertColumn(2, "Placed", width=52)
         ap.Add(self.anchor_list, 1, wx.EXPAND | wx.ALL, 6)
         arow = wx.BoxSizer(wx.HORIZONTAL)
         self.btn_anchor_sel = wx.Button(anchors_pg, label="Place selected")
@@ -777,9 +778,10 @@ class RouterDialog(wx.Dialog):
         # Subsystems page
         sp = wx.BoxSizer(wx.VERTICAL)
         self.subsys_list = wx.ListCtrl(subs_pg, style=wx.LC_REPORT)
-        self.subsys_list.InsertColumn(0, "Subsystem", width=230)
-        self.subsys_list.InsertColumn(1, "Sats", width=44)
-        self.subsys_list.InsertColumn(2, "Placed", width=56)
+        self.subsys_list.InsertColumn(0, "Subsystem", width=196)
+        self.subsys_list.InsertColumn(1, "Size(mm)", width=66)
+        self.subsys_list.InsertColumn(2, "Sats", width=40)
+        self.subsys_list.InsertColumn(3, "Placed", width=50)
         sp.Add(self.subsys_list, 1, wx.EXPAND | wx.ALL, 6)
         srow = wx.BoxSizer(wx.HORIZONTAL)
         self.btn_place_anchor = wx.Button(subs_pg, label="Place anchor")
@@ -792,9 +794,10 @@ class RouterDialog(wx.Dialog):
         self.sat_label = wx.StaticText(subs_pg, label="Satellites: —")
         sp.Add(self.sat_label, 0, wx.LEFT | wx.RIGHT, 6)
         self.sat_list = wx.ListCtrl(subs_pg, style=wx.LC_REPORT)
-        self.sat_list.InsertColumn(0, "Ref", width=56)
-        self.sat_list.InsertColumn(1, "Name", width=150)
-        self.sat_list.InsertColumn(2, "Placed", width=56)
+        self.sat_list.InsertColumn(0, "Ref", width=50)
+        self.sat_list.InsertColumn(1, "Name", width=130)
+        self.sat_list.InsertColumn(2, "Size(mm)", width=64)
+        self.sat_list.InsertColumn(3, "Placed", width=50)
         sp.Add(self.sat_list, 1, wx.EXPAND | wx.ALL, 6)
         subs_pg.SetSizer(sp)
 
@@ -802,10 +805,11 @@ class RouterDialog(wx.Dialog):
         stp = wx.BoxSizer(wx.VERTICAL)
         self.allsat_list = wx.ListCtrl(sats_pg,
                                        style=wx.LC_REPORT)
-        self.allsat_list.InsertColumn(0, "Ref", width=52)
-        self.allsat_list.InsertColumn(1, "Name", width=150)
-        self.allsat_list.InsertColumn(2, "Subsystem", width=90)
-        self.allsat_list.InsertColumn(3, "Placed", width=54)
+        self.allsat_list.InsertColumn(0, "Ref", width=48)
+        self.allsat_list.InsertColumn(1, "Name", width=140)
+        self.allsat_list.InsertColumn(2, "Subsystem", width=80)
+        self.allsat_list.InsertColumn(3, "Size(mm)", width=60)
+        self.allsat_list.InsertColumn(4, "Placed", width=50)
         stp.Add(self.allsat_list, 1, wx.EXPAND | wx.ALL, 6)
         strow = wx.BoxSizer(wx.HORIZONTAL)
         self.btn_sat_sel = wx.Button(sats_pg, label="Place selected")
@@ -1226,8 +1230,10 @@ class RouterDialog(wx.Dialog):
             fp = fps.get(r)
             placed = fp is not None and not placement.is_unplaced(fp, region)
             nm = table[r].get("name") or table[r].get("value") or r
+            w, h = placement._fp_size(fp) if fp else (0, 0)
             row = L.InsertItem(L.GetItemCount(), "%s (%s)" % (r, nm))
-            L.SetItem(row, 1, "yes" if placed else "no")
+            L.SetItem(row, 1, "%.1f×%.1f" % (w, h))
+            L.SetItem(row, 2, "yes" if placed else "no")
 
     def _refresh_satellites(self):
         table = self._place_table()
@@ -1247,10 +1253,12 @@ class RouterDialog(wx.Dialog):
             placed = fp is not None and not placement.is_unplaced(fp, region)
             par = info["parents"][0] if info.get("parents") else "-"
             pname = table.get(par, {}).get("value") or par
+            w, h = placement._fp_size(fp) if fp else (0, 0)
             row = L.InsertItem(L.GetItemCount(), r)
             L.SetItem(row, 1, info.get("name") or info.get("value") or "")
             L.SetItem(row, 2, pname)
-            L.SetItem(row, 3, "yes" if placed else "no")
+            L.SetItem(row, 3, "%.1f×%.1f" % (w, h))
+            L.SetItem(row, 4, "yes" if placed else "no")
 
     def _selected_rows(self, listctrl, refs):
         out, i = [], listctrl.GetFirstSelected()
@@ -1309,9 +1317,11 @@ class RouterDialog(wx.Dialog):
             fp = fps.get(r)
             placed = fp is not None and not placement.is_unplaced(fp, region)
             nm = info.get("name") or info.get("value") or r
+            w, h = placement._fp_size(fp) if fp else (0, 0)
             row = L.InsertItem(L.GetItemCount(), "%s (%s)" % (r, nm))
-            L.SetItem(row, 1, str(len(placement.satellites_of(table, r))))
-            L.SetItem(row, 2, "yes" if placed else "no")
+            L.SetItem(row, 1, "%.1f×%.1f" % (w, h))
+            L.SetItem(row, 2, str(len(placement.satellites_of(table, r))))
+            L.SetItem(row, 3, "yes" if placed else "no")
         self._refresh_sat_detail()
 
     def _selected_subsys_refs(self):
@@ -1338,10 +1348,12 @@ class RouterDialog(wx.Dialog):
         for s in sats:
             fp = fps.get(s)
             placed = fp is not None and not placement.is_unplaced(fp, region)
+            w, h = placement._fp_size(fp) if fp else (0, 0)
             row = self.sat_list.InsertItem(self.sat_list.GetItemCount(), s)
             self.sat_list.SetItem(row, 1, table[s].get("name")
                                   or table[s].get("value", ""))
-            self.sat_list.SetItem(row, 2, "yes" if placed else "no")
+            self.sat_list.SetItem(row, 2, "%.1f×%.1f" % (w, h))
+            self.sat_list.SetItem(row, 3, "yes" if placed else "no")
 
     def _on_subsys_select(self, _evt):
         self._refresh_sat_detail()
