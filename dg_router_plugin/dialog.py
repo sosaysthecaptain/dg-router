@@ -1174,8 +1174,20 @@ class RouterDialog(wx.Dialog):
 
     # --- placement: the component table ------------------------------------
     def _on_tab(self, _evt):
-        if self.tabs.GetSelection() == 2 and self._loaded:   # Place tab
-            self._refresh_place_all()
+        # On Place, hide our preview and slim to a control strip — placement
+        # happens in KiCad's own canvas (where you also nudge the parts). Routing
+        # keeps the preview.
+        place = self.tabs.GetSelection() == 2
+        self.panel.GetSizer().Show(self.preview, not place)  # frees its space
+        self.panel.Layout()
+        h = self.GetSize().height
+        if place:
+            if self.GetSize().width > 520:
+                self.SetSize((430, h))
+            if self._loaded:
+                self._refresh_place_all()
+        elif self.GetSize().width < 700:
+            self.SetSize((1040, h))
 
     def _on_ptab(self, _evt):
         if self._loaded:
@@ -1341,23 +1353,28 @@ class RouterDialog(wx.Dialog):
                           "first, then its satellites.", "dg-router")
             return
         _NM = 1e6
-        fps = {fp.GetReference(): fp for fp in self.board.GetFootprints()
-               if fp.GetReference()}
-        self._undo_positions = {}
-        n = 0
-        for ref, (x, y) in proposed.items():
-            fp = fps.get(ref)
-            if not fp:
-                continue
-            p = fp.GetPosition()
-            self._undo_positions[ref] = (p.x, p.y)
-            fp.SetPosition(pcbnew.VECTOR2I(int(x * _NM), int(y * _NM)))
-            n += 1
-        self._refresh_canvas()          # KiCad canvas now shows the moved parts
-        self._refresh_place_all()
+        try:
+            fps = {fp.GetReference(): fp for fp in self.board.GetFootprints()
+                   if fp.GetReference()}
+            self._undo_positions = {}
+            n = 0
+            for ref, (x, y) in proposed.items():
+                fp = fps.get(ref)
+                if not fp:
+                    continue
+                p = fp.GetPosition()
+                self._undo_positions[ref] = (p.x, p.y)
+                fp.SetPosition(pcbnew.VECTOR2I(int(x * _NM), int(y * _NM)))
+                n += 1
+            self._refresh_canvas()      # KiCad canvas now shows the moved parts
+            self._refresh_place_all()
+        except Exception as e:  # noqa: BLE001
+            self._text_dialog("Placement error",
+                              "%s\n\n%s" % (e, traceback.format_exc()))
+            return
         self.btn_undo_place.Enable(bool(self._undo_positions))
-        self.status.SetLabel("Placed %d %s — nudge in KiCad, then place the next "
-                             "(Cmd+S to save; or Undo)." % (n, what))
+        self.status.SetLabel("Placed %d %s in KiCad — nudge there, then place the "
+                             "next (Cmd+S to save; or Undo)." % (n, what))
 
     def on_undo_place(self, _evt):
         for ref, (x, y) in self._undo_positions.items():
