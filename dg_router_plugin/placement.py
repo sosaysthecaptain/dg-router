@@ -370,129 +370,39 @@ def _satellite_target(board, ref, info, fps, cn, net_size, region):
     return (p.x / _NM, p.y / _NM)
 
 
-def _net_pad_positions(board):
-    """{netcode: [(x_mm, y_mm, owner_ref), ...]} for every routable-net pad."""
-    out = {}
-    for pad in board.GetPads():
-        nc = pad.GetNetCode()
-        if nc <= 0:
-            continue
-        fp = pad.GetParentFootprint()
-        ref = fp.GetReference() if fp else ""
-        p = pad.GetPosition()
-        out.setdefault(nc, []).append((p.x / _NM, p.y / _NM, ref))
-    return out
-
-
 def place_satellites(board, table, reposition=None):
-    """Force-directed placement of satellites: each is spring-pulled toward the
-    pads it connects to (minimising net length) while courtyards repel each other
-    (no overlap). Iterate to equilibrium, snap to grid. Parent must be placed.
-
-    Places unplaced satellites; `reposition` refs are moved even if already placed.
-    """
+    """Place each satellite at the nearest free spot to the PARENT pad it serves
+    (kept local to its subsystem — never chases far-flung connected parts).
+    Works one-at-a-time or in bulk. Placed satellites' current spots are freed so
+    a re-place doesn't collide with itself."""
     reposition = set(reposition or [])
     region = _board_region(board)
-    rx0, ry0, rx1, ry1 = region
     fps = {fp.GetReference(): fp for fp in board.GetFootprints()
            if fp.GetReference()}
     cn, net_size, _ = _component_nets(board)
-    net_pads = _net_pad_positions(board)
 
-    movable = [r for r, i in table.items() if i["type"] == "satellite"
-               and r in fps and (is_unplaced(fps[r], region) or r in reposition)]
-    if not movable:
-        return {}
-    mset = set(movable)
-    size = {r: _fp_size(fps[r]) for r in movable}
-
-    # fixed obstacles: every placed part not being moved
-    fixed = []
+    sats = [r for r, i in table.items() if i["type"] == "satellite"
+            and r in fps and (is_unplaced(fps[r], region) or r in reposition)]
+    moving = set(sats)
+    placed = []                                     # obstacles: on-board, not moving
     for r, fp in fps.items():
-        if r in mset or is_unplaced(fp, region):
+        if r in moving or is_unplaced(fp, region):
             continue
         w, h = _fp_size(fp)
         p = fp.GetPosition()
-        fixed.append((p.x / _NM, p.y / _NM, w, h))
+        placed.append([p.x / _NM, p.y / _NM, w, h])
 
-    # spring targets per satellite: for each low-fanout net it's on, the centroid
-    # of the OTHER pads on that net (its actual connection point)
-    targets = {}
-    for r in movable:
-        tps = []
-        for nc in cn.get(r, set()):
-            if net_size.get(nc, 99) > 8:          # skip power/GND (uninformative)
-                continue
-            others = [(x, y) for (x, y, o) in net_pads.get(nc, []) if o != r]
-            if others:
-                cx = sum(p[0] for p in others) / len(others)
-                cy = sum(p[1] for p in others) / len(others)
-                tps.append((cx, cy, 1.0 / net_size[nc]))
-        if not tps:                                # only power/GND: pull to parent
-            for par in table[r].get("parents", []):
-                if par in fps and not is_unplaced(fps[par], region):
-                    p = fps[par].GetPosition()
-                    tps.append((p.x / _NM, p.y / _NM, 0.5))
-                    break
-        targets[r] = tps
-
-    # initialise near each satellite's target (so it starts short, then settles)
-    pos = {}
-    for r in movable:
-        if targets[r]:
-            tw = sum(t[2] for t in targets[r])
-            pos[r] = [sum(t[0] * t[2] for t in targets[r]) / tw,
-                      sum(t[1] * t[2] for t in targets[r]) / tw]
-        else:
-            p = fps[r].GetPosition()
-            pos[r] = [p.x / _NM, p.y / _NM]
-
-    KS, KR, STEP, GAP = 0.9, 0.6, 0.5, 0.35
-    for _ in range(220):
-        force = {r: [0.0, 0.0] for r in movable}
-        for r in movable:
-            x, y = pos[r]
-            for (tx, ty, w) in targets[r]:        # springs -> connections
-                force[r][0] += (tx - x) * w * KS
-                force[r][1] += (ty - y) * w * KS
-        # repulsion: movable vs fixed, and movable vs movable
-        mb = [(r, pos[r][0], pos[r][1], size[r][0], size[r][1]) for r in movable]
-        for (r, x, y, w, h) in mb:
-            for (ox, oy, ow, oh) in fixed:
-                _repel(force[r], x, y, w, h, ox, oy, ow, oh, GAP, KR)
-            for (r2, x2, y2, w2, h2) in mb:
-                if r2 != r:
-                    _repel(force[r], x, y, w, h, x2, y2, w2, h2, GAP, KR)
-        for r in movable:
-            w, h = size[r]
-            nx = pos[r][0] + force[r][0] * STEP
-            ny = pos[r][1] + force[r][1] * STEP
-            pos[r] = [max(rx0 + w / 2, min(rx1 - w / 2, nx)),
-                      max(ry0 + h / 2, min(ry1 - h / 2, ny))]
-
-    # legalize: force-directed gives good (short-net) positions but can still
-    # overlap; snap each to the nearest FREE spot to its ideal, most-connected
-    # first, so overlaps are impossible in the result.
-    placed_boxes = list(fixed)
-    out = {}
-    for r in sorted(movable, key=lambda r: -len(targets[r])):
-        w, h = size[r]
-        sx, sy = _spiral_free(pos[r][0], pos[r][1], w, h, placed_boxes, region, GAP)
-        out[r] = (round(sx * 2) / 2, round(sy * 2) / 2)
-        placed_boxes.append([out[r][0], out[r][1], w, h])
-    return out
-
-
-def _repel(force, x, y, w, h, ox, oy, ow, oh, gap, k):
-    """Push (x,y)-box out of the (ox,oy)-box along the least-penetration axis."""
-    dx, dy = x - ox, y - oy
-    minx, miny = (w + ow) / 2.0 + gap, (h + oh) / 2.0 + gap
-    if abs(dx) < minx and abs(dy) < miny:
-        penx, peny = minx - abs(dx), miny - abs(dy)
-        if penx < peny:
-            force[0] += (penx if dx >= 0 else -penx) * k
-        else:
-            force[1] += (peny if dy >= 0 else -peny) * k
+    proposed = {}
+    for ref in sats:
+        info = table[ref]
+        w, h = _fp_size(fps[ref])
+        tx, ty = _satellite_target(board, ref, info, fps, cn, net_size, region)
+        if tx is None:
+            continue
+        pos = _spiral_free(tx, ty, w, h, placed, region, 0.3)
+        proposed[ref] = pos
+        placed.append([pos[0], pos[1], w, h])
+    return proposed
 
 
 def _spiral_free(tx, ty, w, h, placed, region, m):
