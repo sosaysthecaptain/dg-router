@@ -13,6 +13,7 @@ the GUI. `pcbnew` is imported lazily so this stays importable headless.
 
 import os
 import json
+import math
 
 _NM = 1e6
 
@@ -215,6 +216,47 @@ def _fanout_halo(fp):
     return round(min(halo, 3.0), 2)
 
 
+def _fp_box(fp):
+    """(cx, cy, w, h) mm — courtyard bbox CENTER + size. Center matters for ICs
+    whose courtyard isn't centered on the footprint anchor."""
+    import pcbnew
+    for layer in (pcbnew.F_Cu, pcbnew.B_Cu):
+        try:
+            cy = fp.GetCourtyard(layer)
+            if cy and not cy.IsEmpty():
+                bb = cy.BBox()
+                c = bb.GetCenter()
+                return (c.x / _NM, c.y / _NM,
+                        bb.GetWidth() / _NM + 0.3, bb.GetHeight() / _NM + 0.3)
+        except Exception:
+            pass
+    p = fp.GetPosition()
+    w, h = _fp_size(fp)
+    return (p.x / _NM, p.y / _NM, w, h)
+
+
+def _canonical_wh(fp):
+    """(w, h) of a footprint at orientation 0 (pads horizontal), regardless of
+    how it's currently rotated — so we can reason about it at any target angle."""
+    w, h = _fp_size(fp)
+    if int(round(fp.GetOrientationDegrees())) % 180 != 0:
+        w, h = h, w
+    return w, h
+
+
+def _pad_on_net(fp, netcode):
+    for pad in fp.Pads():
+        if pad.GetNetCode() == netcode:
+            return pad
+    return None
+
+
+def _rot(x, y, deg):
+    r = math.radians(deg)
+    c, s = math.cos(r), math.sin(r)
+    return (x * c - y * s, x * s + y * c)
+
+
 def _overlap(ax, ay, aw, ah, bx, by, bw, bh, gap=0.4):
     return (abs(ax - bx) < (aw + bw) / 2.0 + gap and
             abs(ay - by) < (ah + bh) / 2.0 + gap)
@@ -375,36 +417,61 @@ def place_subsystems(board, table, reposition=None):
     return proposed
 
 
-def _satellite_target(board, ref, info, fps, cn, net_size, region):
-    """Where a satellite wants to sit: on top of the parent PAD it serves (the
-    lowest-fanout shared net = the specific signal pin), so the trace is tiny."""
+def _sat_target(board, ref, info, fps, cn, net_size, region):
+    """The parent PAD a satellite serves: the lowest-fanout shared net = the
+    specific signal pin, so its trace is short. Returns (parent_ref, px, py,
+    netcode) in mm, or None if the parent isn't placed."""
     par = None
-    for p in info["parents"]:
+    for p in info.get("parents", []):
         if p in fps and not is_unplaced(fps[p], region):
             par = p
             break
     if par is None:
-        return (None, None)
+        return None
     shared = cn.get(ref, set()) & cn.get(par, set())
     best_net, best_sz = None, 1e9
     for nc in shared:
         if net_size.get(nc, 1e9) < best_sz:
             best_sz, best_net = net_size[nc], nc
     parfp = fps[par]
-    if best_net is not None:
-        for pad in parfp.Pads():
-            if pad.GetNetCode() == best_net:
-                pp = pad.GetPosition()
-                return (pp.x / _NM, pp.y / _NM)
+    pad = _pad_on_net(parfp, best_net) if best_net is not None else None
+    if pad is not None:
+        pp = pad.GetPosition()
+        return (par, pp.x / _NM, pp.y / _NM, best_net)
     p = parfp.GetPosition()
-    return (p.x / _NM, p.y / _NM)
+    return (par, p.x / _NM, p.y / _NM, best_net)
+
+
+_SIDE_TOWARD = {"R": (-1.0, 0.0), "L": (1.0, 0.0), "T": (0.0, 1.0), "B": (0.0, -1.0)}
+
+
+def _sat_orientation(fp, netcode, side):
+    """A 90-degree orientation for a satellite so its connecting pad points TOWARD
+    the chip (shortest trace) and its body lies flat along the rank. L/R -> pads
+    horizontal (0deg), T/B -> pads vertical (90deg); +180 if that would aim the
+    connecting pad away from the chip."""
+    base = 0.0 if side in ("L", "R") else 90.0
+    pad = _pad_on_net(fp, netcode) if netcode is not None else None
+    if pad is not None:
+        p0 = pad.GetFPRelativePosition()  # pad offset in the unrotated fp frame
+        ox, oy = _rot(p0.x, p0.y, base)
+        tx, ty = _SIDE_TOWARD[side]
+        if ox * tx + oy * ty < 0:        # pad points away from chip -> flip
+            base += 180.0
+    return base % 360.0
 
 
 def place_satellites(board, table, reposition=None):
-    """Place each satellite at the nearest free spot to the PARENT pad it serves
-    (kept local to its subsystem — never chases far-flung connected parts).
-    Works one-at-a-time or in bulk. Placed satellites' current spots are freed so
-    a re-place doesn't collide with itself."""
+    """Tidy per-side placement. Each subsystem's passives are grouped by the chip
+    EDGE nearest the pin they serve, then laid in a straight, evenly-spaced,
+    aligned RANK just off that edge — oriented (in 90deg steps) so the connecting
+    pad faces the chip for the shortest trace. Ranks push outward to dodge other
+    parts; anything with no room is skipped (never stacked).
+
+    Returns {ref: (x, y, orient_deg)}. Bulk = full clean ranks; a subset lands
+    each part on its rank line near its pin. Rough-place for short nets, THEN
+    neaten — exactly the two-phase intent.
+    """
     reposition = set(reposition or [])
     region = _board_region(board)
     fps = {fp.GetReference(): fp for fp in board.GetFootprints()
@@ -414,28 +481,120 @@ def place_satellites(board, table, reposition=None):
     sats = [r for r, i in table.items() if i["type"] == "satellite"
             and r in fps and (is_unplaced(fps[r], region) or r in reposition)]
     moving = set(sats)
-    placed = []                                     # obstacles: on-board, not moving
+
+    # obstacles = every on-board part we're NOT moving (courtyard box + halo)
+    obstacles = []
     for r, fp in fps.items():
         if r in moving or is_unplaced(fp, region):
             continue
-        w, h = _fp_size(fp)
-        p = fp.GetPosition()
-        placed.append([p.x / _NM, p.y / _NM, w, h, _fanout_halo(fp)])
+        cx, cy, w, h = _fp_box(fp)
+        obstacles.append([cx, cy, w, h, _fanout_halo(fp)])
+
+    # assign each mover to a parent + chip edge (side) based on the pin it serves
+    by_parent, meta = {}, {}
+    for ref in sats:
+        tgt = _sat_target(board, ref, table[ref], fps, cn, net_size, region)
+        if tgt is None:
+            continue
+        par, px, py, nc = tgt
+        pcx, pcy, pw, ph = _fp_box(fps[par])
+        dx, dy = px - pcx, py - pcy
+        phw, phh = max(pw / 2.0, 0.1), max(ph / 2.0, 0.1)
+        if abs(dx) / phw >= abs(dy) / phh:
+            side = "R" if dx >= 0 else "L"
+        else:
+            side = "B" if dy >= 0 else "T"
+        meta[ref] = (par, px, py, nc, side)
+        by_parent.setdefault(par, []).append(ref)
 
     proposed = {}
-    for ref in sats:
-        info = table[ref]
-        w, h = _fp_size(fps[ref])
-        hz = _fanout_halo(fps[ref])
-        tx, ty = _satellite_target(board, ref, info, fps, cn, net_size, region)
-        if tx is None:
-            continue
-        pos = _spiral_free(tx, ty, w, h, placed, region, 0.3, halo=hz)
-        if pos is None:                 # no room — skip rather than overlap
-            continue
-        proposed[ref] = pos
-        placed.append([pos[0], pos[1], w, h, hz])
+    for par, refs in by_parent.items():
+        sides = {}
+        for ref in refs:
+            sides.setdefault(meta[ref][4], []).append(ref)
+        for side, members in sides.items():
+            _place_rank(side, members, meta, fps, region, obstacles, proposed)
     return proposed
+
+
+def _place_rank(side, members, meta, fps, region, obstacles, proposed):
+    """Lay one chip edge's satellites in a straight aligned rank near their pins.
+    Mutates `proposed` (ref -> (x,y,deg)) and `obstacles`."""
+    rx0, ry0, rx1, ry1 = region
+    vert = side in ("L", "R")            # rank runs along Y?
+    sign = 1.0 if side in ("R", "B") else -1.0
+    gap = 0.45
+
+    par = meta[members[0]][0]
+    pcx, pcy, pw, ph = _fp_box(fps[par])
+    H = _fanout_halo(fps[par])
+
+    items = []
+    for ref in members:
+        nc = meta[ref][3]
+        deg = _sat_orientation(fps[ref], nc, side)
+        w0, h0 = _canonical_wh(fps[ref])
+        w, h = (w0, h0) if int(round(deg)) % 180 == 0 else (h0, w0)
+        want = meta[ref][2] if vert else meta[ref][1]   # pin coord along the edge
+        items.append({"ref": ref, "deg": deg, "w": w, "h": h, "want": want,
+                      "halo": _fanout_halo(fps[ref])})
+    if not items:
+        return
+    items.sort(key=lambda it: it["want"])
+
+    def along(it):
+        return it["h"] if vert else it["w"]
+
+    def perp(it):
+        return it["w"] if vert else it["h"]
+
+    # spread along the edge: keep near the pin, enforce min pitch (both directions)
+    pos = [it["want"] for it in items]
+    for i in range(1, len(items)):
+        need = (along(items[i - 1]) + along(items[i])) / 2.0 + gap
+        pos[i] = max(pos[i], pos[i - 1] + need)
+    for i in range(len(items) - 2, -1, -1):
+        need = (along(items[i]) + along(items[i + 1])) / 2.0 + gap
+        pos[i] = min(pos[i], pos[i + 1] - need)
+
+    maxperp = max(perp(it) for it in items)
+    phalf = (pw if vert else ph) / 2.0
+    base_center = pcx if vert else pcy
+
+    def clears(x, y, it):
+        w, h = it["w"], it["h"]
+        if not (rx0 + w / 2 <= x <= rx1 - w / 2 and
+                ry0 + h / 2 <= y <= ry1 - h / 2):
+            return False
+        for ob in obstacles:
+            if _overlap(x, y, w, h, ob[0], ob[1], ob[2], ob[3],
+                        max(it["halo"], ob[4])):
+                return False
+        return True
+
+    # try successive ranks (pushed outward from the chip). Prefer the CLOSEST
+    # rank whose whole row is clear (tidy + short). If none is fully clear,
+    # fall back to the closest rank that places the MOST parts (survivors stay
+    # near the chip and aligned on one line; the rest are dropped, not stacked).
+    RANKS = 10
+    best = None                              # (count, rank_i, [(x,y,it)...])
+    for rank_i in range(RANKS):
+        rc = base_center + sign * (phalf + H + maxperp / 2.0 + 0.15 +
+                                   rank_i * (maxperp + gap))
+        row = []
+        for it, a in zip(items, pos):
+            x, y = (rc, a) if vert else (a, rc)
+            if clears(x, y, it):
+                row.append((x, y, it))
+        if len(row) == len(items):           # whole rank fits -> take it now
+            best = (len(row), rank_i, row)
+            break
+        if best is None or len(row) > best[0]:
+            best = (len(row), rank_i, row)
+    if best:
+        for x, y, it in best[2]:
+            proposed[it["ref"]] = (x, y, it["deg"])
+            obstacles.append([x, y, it["w"], it["h"], it["halo"]])
 
 
 def _spiral_free(tx, ty, w, h, placed, region, m, halo=0.6):

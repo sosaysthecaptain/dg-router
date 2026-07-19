@@ -1402,13 +1402,17 @@ class RouterDialog(wx.Dialog):
                    if fp.GetReference()}
             self._undo_positions = {}
             n = 0
-            for ref, (x, y) in proposed.items():
+            for ref, val in proposed.items():
                 fp = fps.get(ref)
                 if not fp:
                     continue
+                x, y = val[0], val[1]
+                deg = val[2] if len(val) > 2 else None
                 p = fp.GetPosition()
-                self._undo_positions[ref] = (p.x, p.y)
+                self._undo_positions[ref] = (p.x, p.y, fp.GetOrientationDegrees())
                 fp.SetPosition(pcbnew.VECTOR2I(int(x * _NM), int(y * _NM)))
+                if deg is not None:
+                    fp.SetOrientationDegrees(deg)
                 n += 1
             self._refresh_canvas()      # KiCad canvas now shows the moved parts
             self._refresh_place_all()
@@ -1425,10 +1429,12 @@ class RouterDialog(wx.Dialog):
         self.status.SetLabel(msg)
 
     def on_undo_place(self, _evt):
-        for ref, (x, y) in self._undo_positions.items():
+        for ref, saved in self._undo_positions.items():
             fp = self.board.FindFootprintByReference(ref)
             if fp:
-                fp.SetPosition(pcbnew.VECTOR2I(x, y))
+                fp.SetPosition(pcbnew.VECTOR2I(saved[0], saved[1]))
+                if len(saved) > 2:
+                    fp.SetOrientationDegrees(saved[2])
         self._undo_positions = {}
         self._refresh_canvas()
         self._refresh_place_all()
