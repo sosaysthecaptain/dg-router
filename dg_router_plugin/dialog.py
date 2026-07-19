@@ -518,6 +518,89 @@ class PreviewPanel(wx.Panel):
                     gc.DrawText(p["ref"], cx - tw / 2, cy - th / 2)
 
 
+class ComponentTableDialog(wx.Dialog):
+    """A wide, resizable window for verifying/editing the classification of every
+    part: Ref | Name | Value | Type | Parents | Placed. Name/Type/Parents are
+    editable and persist to the sidecar (agents edit the same file)."""
+
+    def __init__(self, parent, board, on_changed=None):
+        super().__init__(parent, title="Component table", size=(820, 640),
+                         style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER)
+        self.board = board
+        self.bp = board.GetFileName()
+        self.on_changed = on_changed
+        g = wx.grid.Grid(self)
+        self.grid = g
+        g.CreateGrid(0, 6)
+        for i, lbl in enumerate(["Ref", "Name", "Value", "Type", "Parents",
+                                 "Placed"]):
+            g.SetColLabelValue(i, lbl)
+        for i, w in enumerate((70, 180, 100, 150, 220, 60)):
+            g.SetColSize(i, w)
+        g.SetRowLabelSize(0)
+        tattr = wx.grid.GridCellAttr()
+        tattr.SetEditor(wx.grid.GridCellChoiceEditor(
+            ["anchor", "subsystem_anchor", "satellite"], allowOthers=False))
+        g.SetColAttr(3, tattr)
+        self._populate()
+        g.Bind(wx.grid.EVT_GRID_CELL_CHANGED, self._on_edit)
+        s = wx.BoxSizer(wx.VERTICAL)
+        s.Add(g, 1, wx.EXPAND | wx.ALL, 6)
+        b = wx.Button(self, wx.ID_CLOSE, "Close")
+        b.Bind(wx.EVT_BUTTON, lambda e: self.Close())
+        s.Add(b, 0, wx.ALIGN_RIGHT | wx.ALL, 6)
+        self.SetSizer(s)
+        self.Bind(wx.EVT_CLOSE, self._on_close)
+
+    def _populate(self):
+        t = placement.effective_table(self.board, self.bp)
+        region = placement._board_region(self.board)
+        fps = {fp.GetReference(): fp for fp in self.board.GetFootprints()
+               if fp.GetReference()}
+        rank = {"anchor": 0, "subsystem_anchor": 1, "satellite": 2}
+        refs = sorted(t, key=lambda r: (rank.get(t[r]["type"], 9),
+                                        (t[r].get("name") or r).lower()))
+        g = self.grid
+        if g.GetNumberRows():
+            g.DeleteRows(0, g.GetNumberRows())
+        g.AppendRows(len(refs))
+        self._refs = refs
+        for i, r in enumerate(refs):
+            info = t[r]
+            fp = fps.get(r)
+            placed = fp is not None and not placement.is_unplaced(fp, region)
+            g.SetCellValue(i, 0, r)
+            g.SetCellValue(i, 1, info.get("name") or "")
+            g.SetCellValue(i, 2, info.get("value", ""))
+            g.SetCellValue(i, 3, info["type"])
+            g.SetCellValue(i, 4, ", ".join(info.get("parents", [])))
+            g.SetCellValue(i, 5, "yes" if placed else "no")
+            for c in (0, 2, 5):
+                g.SetReadOnly(i, c, True)
+
+    def _on_edit(self, evt):
+        r, c = evt.GetRow(), evt.GetCol()
+        if c in (1, 3, 4):
+            ref = self._refs[r]
+            saved = placement.load_table(self.bp)
+            cur = saved.setdefault("components", {}).setdefault(ref, {})
+            if c == 1:
+                cur["name"] = self.grid.GetCellValue(r, 1)
+            elif c == 3:
+                cur["type"] = self.grid.GetCellValue(r, 3)
+            else:
+                cur["parents"] = [p.strip() for p in
+                                  self.grid.GetCellValue(r, 4).split(",")
+                                  if p.strip()]
+            placement.save_table(self.bp, saved)
+        evt.Skip()
+
+    def _on_close(self, evt):
+        if self.on_changed:
+            self.on_changed()
+        evt.Skip()
+
+
 class RouterDialog(wx.Dialog):
     def __init__(self, board):
         super().__init__(None, title="dg-router", size=(1040, 760),
@@ -648,32 +731,47 @@ class RouterDialog(wx.Dialog):
         prow.Add(wx.StaticText(place_pg, label="Subsystems"),
                  0, wx.ALIGN_CENTER_VERTICAL)
         prow.AddStretchSpacer(1)
-        self.btn_reclassify = wx.Button(place_pg, label="Re-infer", size=(90, -1))
+        self.btn_edit_table = wx.Button(place_pg, label="Component table…",
+                                        size=(130, -1))
+        self.btn_reclassify = wx.Button(place_pg, label="Re-infer", size=(80, -1))
+        prow.Add(self.btn_edit_table, 0, wx.RIGHT, 4)
         prow.Add(self.btn_reclassify, 0)
         plp.Add(prow, 0, wx.EXPAND | wx.ALL, 8)
 
-        # master: named subsystems (double-click Name to rename)
-        self.subsys_list = wx.ListCtrl(
-            place_pg, style=wx.LC_REPORT | wx.LC_EDIT_LABELS)
+        # master: named subsystems (name = the lead component's human name)
+        self.subsys_list = wx.ListCtrl(place_pg, style=wx.LC_REPORT)
         self.subsys_list.InsertColumn(0, "Name", width=150)
         self.subsys_list.InsertColumn(1, "Anchor", width=60)
         self.subsys_list.InsertColumn(2, "Sats", width=44)
         self.subsys_list.InsertColumn(3, "Placed", width=56)
         plp.Add(self.subsys_list, 1, wx.EXPAND | wx.LEFT | wx.RIGHT, 8)
 
+        # place the SELECTED subsystems
         arow = wx.BoxSizer(wx.HORIZONTAL)
         self.btn_place_anchor = wx.Button(place_pg, label="Place anchor")
         self.btn_place_sats = wx.Button(place_pg, label="Place satellites")
         arow.Add(self.btn_place_anchor, 1, wx.RIGHT, 6)
         arow.Add(self.btn_place_sats, 1)
-        plp.Add(arow, 0, wx.EXPAND | wx.ALL, 8)
+        plp.Add(wx.StaticText(place_pg, label="Selected subsystem(s):"),
+                0, wx.LEFT | wx.TOP, 8)
+        plp.Add(arow, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 8)
 
-        # detail: the satellites of the selected subsystem (so you see what's in it)
+        # place EVERYTHING of a kind
+        brow = wx.BoxSizer(wx.HORIZONTAL)
+        self.btn_place_all_anchors = wx.Button(place_pg, label="All anchors")
+        self.btn_place_all_sats = wx.Button(place_pg, label="All satellites")
+        brow.Add(self.btn_place_all_anchors, 1, wx.RIGHT, 6)
+        brow.Add(self.btn_place_all_sats, 1)
+        plp.Add(wx.StaticText(place_pg, label="Place all unplaced:"),
+                0, wx.LEFT, 8)
+        plp.Add(brow, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 8)
+
+        # detail: the satellites of the selected subsystem
         self.sat_label = wx.StaticText(place_pg, label="Satellites: —")
         plp.Add(self.sat_label, 0, wx.LEFT | wx.RIGHT, 8)
         self.sat_list = wx.ListCtrl(place_pg, style=wx.LC_REPORT)
         self.sat_list.InsertColumn(0, "Ref", width=60)
-        self.sat_list.InsertColumn(1, "Value", width=120)
+        self.sat_list.InsertColumn(1, "Name", width=120)
         self.sat_list.InsertColumn(2, "Placed", width=60)
         plp.Add(self.sat_list, 1, wx.EXPAND | wx.ALL, 8)
         place_pg.SetSizer(plp)
@@ -718,9 +816,12 @@ class RouterDialog(wx.Dialog):
         self.btn_cancel.Bind(wx.EVT_BUTTON, self.on_cancel)
         self.btn_place_anchor.Bind(wx.EVT_BUTTON, self.on_place_anchor)
         self.btn_place_sats.Bind(wx.EVT_BUTTON, self.on_place_satellites)
+        self.btn_place_all_anchors.Bind(wx.EVT_BUTTON, self.on_place_all_anchors)
+        self.btn_place_all_sats.Bind(wx.EVT_BUTTON, self.on_place_all_satellites)
         self.btn_reclassify.Bind(wx.EVT_BUTTON, self.on_reclassify)
+        self.btn_edit_table.Bind(wx.EVT_BUTTON, self.on_edit_table)
         self.subsys_list.Bind(wx.EVT_LIST_ITEM_SELECTED, self._on_subsys_select)
-        self.subsys_list.Bind(wx.EVT_LIST_END_LABEL_EDIT, self._on_subsys_rename)
+        self.subsys_list.Bind(wx.EVT_LIST_ITEM_DESELECTED, self._on_subsys_select)
         self.tabs.Bind(wx.EVT_NOTEBOOK_PAGE_CHANGED, self._on_tab)
         self.btn_try.Bind(wx.EVT_BUTTON, self.on_try_again)
         self.btn_commit.Bind(wx.EVT_BUTTON, self.on_commit)
@@ -1081,22 +1182,19 @@ class RouterDialog(wx.Dialog):
             fp = fps.get(s)
             placed = fp is not None and not placement.is_unplaced(fp, region)
             row = self.sat_list.InsertItem(self.sat_list.GetItemCount(), s)
-            self.sat_list.SetItem(row, 1, table[s].get("value", ""))
+            self.sat_list.SetItem(row, 1, table[s].get("name")
+                                  or table[s].get("value", ""))
             self.sat_list.SetItem(row, 2, "yes" if placed else "no")
 
     def _on_subsys_select(self, _evt):
         self._refresh_sat_detail()
 
-    def _on_subsys_rename(self, evt):
-        if evt.IsEditCancelled() or not evt.GetLabel().strip():
-            evt.Veto()
-            return
-        ref = self._subsys_refs[evt.GetIndex()]
-        saved = placement.load_table(self.board.GetFileName())
-        saved.setdefault("components", {}).setdefault(ref, {})["name"] = \
-            evt.GetLabel().strip()
-        placement.save_table(self.board.GetFileName(), saved)
-        evt.Skip()
+    def on_edit_table(self, _evt):
+        """Open the full component table (Ref/Name/Value/Type/Parents) in a wide
+        window; refresh the subsystem list when it closes."""
+        dlg = ComponentTableDialog(self, self.board,
+                                   on_changed=self._refresh_subsystems)
+        dlg.Show()
 
     def on_reclassify(self, _evt):
         placement.save_table(self.board.GetFileName(), {"components": {}})
@@ -1149,6 +1247,16 @@ class RouterDialog(wx.Dialog):
                     placement.place_satellites(self.board, table).items()
                     if r in want}
         self._propose_placements(proposed, "satellite(s)")
+
+    def on_place_all_anchors(self, _evt):
+        table = self._place_table()
+        self._propose_placements(
+            placement.place_subsystems(self.board, table), "anchor(s)")
+
+    def on_place_all_satellites(self, _evt):
+        table = self._place_table()
+        self._propose_placements(
+            placement.place_satellites(self.board, table), "satellite(s)")
 
     def _route_net_ui(self, done, total, result):
         self._shown.append(result)
