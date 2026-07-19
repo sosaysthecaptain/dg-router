@@ -742,10 +742,9 @@ class RouterDialog(wx.Dialog):
 
         # master: named subsystems (name = the lead component's human name)
         self.subsys_list = wx.ListCtrl(place_pg, style=wx.LC_REPORT)
-        self.subsys_list.InsertColumn(0, "Name", width=150)
-        self.subsys_list.InsertColumn(1, "Anchor", width=60)
-        self.subsys_list.InsertColumn(2, "Sats", width=44)
-        self.subsys_list.InsertColumn(3, "Placed", width=56)
+        self.subsys_list.InsertColumn(0, "Subsystem", width=230)
+        self.subsys_list.InsertColumn(1, "Sats", width=44)
+        self.subsys_list.InsertColumn(2, "Placed", width=56)
         plp.Add(self.subsys_list, 1, wx.EXPAND | wx.LEFT | wx.RIGHT, 8)
 
         # place the SELECTED subsystems
@@ -1152,11 +1151,10 @@ class RouterDialog(wx.Dialog):
             info = table[r]
             fp = fps.get(r)
             placed = fp is not None and not placement.is_unplaced(fp, region)
-            row = L.InsertItem(L.GetItemCount(),
-                               info.get("name") or info.get("value") or r)
-            L.SetItem(row, 1, r)
-            L.SetItem(row, 2, str(len(placement.satellites_of(table, r))))
-            L.SetItem(row, 3, "yes" if placed else "no")
+            nm = info.get("name") or info.get("value") or r
+            row = L.InsertItem(L.GetItemCount(), "%s (%s)" % (r, nm))
+            L.SetItem(row, 1, str(len(placement.satellites_of(table, r))))
+            L.SetItem(row, 2, "yes" if placed else "no")
         self._refresh_sat_detail()
 
     def _selected_subsys_refs(self):
