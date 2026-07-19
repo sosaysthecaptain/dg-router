@@ -538,10 +538,15 @@ class RouterDialog(wx.Dialog):
 
         panel = wx.Panel(self)
         main = wx.BoxSizer(wx.HORIZONTAL)
+        # fixed-width left column so a wide child (the grid) can't squeeze the
+        # preview; the preview takes all remaining width
+        leftp = wx.Panel(panel)
+        leftp.SetMinSize((380, -1))
+        leftp.SetMaxSize((400, -1))
         left = wx.BoxSizer(wx.VERTICAL)
 
         # === tabs at the TOP; each tab owns its whole panel ===
-        self.tabs = wx.Notebook(panel)
+        self.tabs = wx.Notebook(leftp)
         route_pg = wx.Panel(self.tabs)
         power_pg = wx.Panel(self.tabs)
         place_pg = wx.Panel(self.tabs)
@@ -658,7 +663,7 @@ class RouterDialog(wx.Dialog):
         for i, lbl in enumerate(["Place", "Ref", "Value", "Type", "Parents",
                                  "Placed"]):
             self.place_grid.SetColLabelValue(i, lbl)
-        for i, w in enumerate((46, 58, 78, 118, 120, 56)):
+        for i, w in enumerate((32, 46, 88, 96, 76, 40)):
             self.place_grid.SetColSize(i, w)
         self.place_grid.SetRowLabelSize(0)
         self.place_grid.DisableDragRowSize()
@@ -677,33 +682,33 @@ class RouterDialog(wx.Dialog):
         place_pg.SetSizer(plp)
 
         # === shared action area (applies to whatever the active tab proposed) ===
-        self.btn_cancel = wx.Button(panel, label="Cancel")
+        self.btn_cancel = wx.Button(leftp, label="Cancel")
         left.Add(self.btn_cancel, 0, wx.EXPAND | wx.LEFT | wx.RIGHT, 8)
         self.btn_cancel.Hide()
 
         self.act_row = wx.BoxSizer(wx.HORIZONTAL)
-        self.btn_commit = wx.Button(panel, label="Accept")
-        self.btn_revert = wx.Button(panel, label="Reject")
-        self.btn_try = wx.Button(panel, label="Try again")
+        self.btn_commit = wx.Button(leftp, label="Accept")
+        self.btn_revert = wx.Button(leftp, label="Reject")
+        self.btn_try = wx.Button(leftp, label="Try again")
         for b in (self.btn_commit, self.btn_revert, self.btn_try):
             self.act_row.Add(b, 1, wx.RIGHT, 6)
         left.Add(self.act_row, 0, wx.EXPAND | wx.LEFT | wx.RIGHT, 8)
 
-        self.gauge = wx.Gauge(panel, range=100)
+        self.gauge = wx.Gauge(leftp, range=100)
         left.Add(self.gauge, 0, wx.EXPAND | wx.LEFT | wx.RIGHT, 8)
         self.gauge.Hide()
 
-        self.status = wx.StaticText(panel, label="Loading…")
+        self.status = wx.StaticText(leftp, label="Loading…")
         left.Add(self.status, 0, wx.ALL, 8)
 
-        self.btn_claude = wx.Button(panel, label="Agent instructions (markdown)")
+        self.btn_claude = wx.Button(leftp, label="Agent instructions (markdown)")
         left.Add(self.btn_claude, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 8)
+        leftp.SetSizer(left)
 
         self.preview = PreviewPanel(panel, board)
         self.preview.on_pad_pick = self._on_pad_pick
         self.preview.on_conn_toggle = self._on_conn_toggle
-        main.Add(left, 0, wx.EXPAND)
-        main.SetItemMinSize(left, 380, -1)
+        main.Add(leftp, 0, wx.EXPAND)
         main.Add(self.preview, 1, wx.EXPAND | wx.ALL, 6)
         panel.SetSizer(main)
         self.panel = panel
